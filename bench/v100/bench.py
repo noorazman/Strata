@@ -262,6 +262,13 @@ def parse_engine(text):
                    ple_ssd_reads=int(m.group(3)), ple_read_mb=float(m.group(4)),
                    ple_p50_us=int(m.group(5)), ple_p99_us=int(m.group(6)),
                    ple_blocked_ms=float(m.group(7)), ple_submit_ms=float(m.group(8)))
+    # Stage 1.2A: RAM-resident PLE (--ple-io ram). No SSD reads; the stats line reports the preload.
+    m = re.search(r"ple ram: (\d+) rows resident \(([\d.]+) GiB\), preloaded in ([\d.]+) s \(([\d.]+) GiB/s\);"
+                  r" served (\d+) rows \(([\d.]+) MB\) from RAM", text)
+    if m:
+        out.update(ple_ram_rows=int(m.group(1)), ple_ram_gib=float(m.group(2)),
+                   ple_ram_preload_s=float(m.group(3)), ple_ram_preload_gibs=float(m.group(4)),
+                   ple_ram_served_rows=int(m.group(5)), ple_ram_served_mb=float(m.group(6)))
     m = re.search(r"speculation\s+(\d+) rounds of (\d+), drafts accepted (\d+) of (\d+)"
                   r" \(([\d.]+)\), ([\d.]+) tokens per round", text)
     if m:
@@ -503,6 +510,10 @@ def main():
     if d.get("ple_blocked_ms") is not None:
         print(f"[bench]   PLE: {d['ple_rows']} rows, {d['ple_ssd_reads']} SSD reads "
               f"({d['ple_read_mb']} MB), p50 {d['ple_p50_us']}us, blocked {d['ple_blocked_ms']} ms")
+    if d.get("ple_ram_gib") is not None:
+        print(f"[bench]   PLE RAM: {d['ple_ram_gib']} GiB resident, preloaded in {d['ple_ram_preload_s']} s "
+              f"({d['ple_ram_preload_gibs']} GiB/s); served {d['ple_ram_served_rows']} rows "
+              f"({d['ple_ram_served_mb']} MB) from RAM")
     if d.get("host_phases_ms_tok"):
         hp = d["host_phases_ms_tok"]
         print(f"[bench]   host phases ms/tok: PLE {hp['ple']:.2f} embed {hp['embed']:.2f} "

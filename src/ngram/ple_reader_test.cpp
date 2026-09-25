@@ -141,8 +141,8 @@ int selftest(const std::string& dir) {
 }
 
 int real(const std::string& gguf, int n_random, const std::string& tokens_path, uint32_t inflight, bool direct_first,
-         bool direct_only, bool sync_submit) {
-    k::PleTable mm, direct;
+         bool direct_only, bool sync_submit, bool ram) {
+    k::PleTable mm, direct, rtab;
     std::string err;
     k::PleIoOptions mo;
     mo.mode = k::PleIo::Mmap;
@@ -154,6 +154,13 @@ int real(const std::string& gguf, int n_random, const std::string& tokens_path, 
     // live section on the same file forces the file system to keep cached and non-cached views coherent.
     if (!direct_only && !mm.open(gguf, err, mo)) { std::fprintf(stderr, "mmap open: %s\n", err.c_str()); return 2; }
     if (!direct.open(gguf, err, dopt)) { std::fprintf(stderr, "direct open: %s\n", err.c_str()); return 2; }
+    // Stage 1.2A arm: the whole table preloaded into RAM. Bit-identity against the other arms is the check.
+    if (ram) {
+        k::PleIoOptions ropt;
+        ropt.mode = k::PleIo::Ram;
+        if (!rtab.open(gguf, err, ropt)) { std::fprintf(stderr, "ram open: %s\n", err.c_str()); return 2; }
+        std::fprintf(stderr, "%s\n", rtab.preload_report().c_str());
+    }
     std::vector<std::vector<uint32_t>> tickets;
     std::mt19937_64 rng(11);
     for (int t = 0; t < n_random / 16; ++t) {
@@ -176,8 +183,8 @@ int real(const std::string& gguf, int n_random, const std::string& tokens_path, 
             tickets.push_back(r);
         }
     }
-    std::vector<float> a(k::NG_N_EMBD), b(k::NG_N_EMBD);
-    double t_mm = 0, t_dir = 0, t_issue = 0;
+    std::vector<float> a(k::NG_N_EMBD), b(k::NG_N_EMBD), c(k::NG_N_EMBD);
+    double t_mm = 0, t_dir = 0, t_issue = 0, t_ram = 0;
     for (const auto& r : tickets) {
         for (int pass = 0; pass < 2; ++pass) {
             const bool do_direct = (pass == 0) == direct_first;
@@ -199,10 +206,23 @@ int real(const std::string& gguf, int n_random, const std::string& tokens_path, 
         }
         if (!direct_only)
             CHECK(!std::memcmp(a.data(), b.data(), a.size() * sizeof(float)), "token rows differ between mmap and direct");
+        if (ram) {
+            const double t0 = now_us();
+            rtab.gather(r.data(), c.data());
+            t_ram += now_us() - t0;
+            CHECK(!std::memcmp(b.data(), c.data(), b.size() * sizeof(float)),
+                  "token rows differ between direct and ram");
+            if (!direct_only)
+                CHECK(!std::memcmp(a.data(), c.data(), a.size() * sizeof(float)),
+                      "token rows differ between mmap and ram");
+        }
     }
     std::printf("tokens %zu: mmap %.1f us/token, direct %.1f us/token (issue on this thread %.1f us)\n%s\n",
                 tickets.size(), t_mm / (double) tickets.size(), t_dir / (double) tickets.size(),
                 t_issue / (double) tickets.size(), direct.io_report().c_str());
+    if (ram)
+        std::printf("ram arm: %.1f us/token (16 rows, no I/O)\n%s\n", t_ram / (double) tickets.size(),
+                    rtab.io_report().c_str());
     std::printf("ple_reader real-table check: %s\n", g_fail ? "FAILED" : "OK (bit-identical)");
     return g_fail ? 1 : 0;
 }
@@ -217,6 +237,7 @@ int main(int argc, char** argv) {
     bool direct_only = false;
     bool sync_submit = false;
     bool self = false;
+    bool ram = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--selftest") self = true;
@@ -228,10 +249,13 @@ int main(int argc, char** argv) {
         else if (a == "--direct-first") direct_first = true;
         else if (a == "--direct-only") direct_only = true;
         else if (a == "--sync") sync_submit = true;
-        else { std::fprintf(stderr, "usage: ple_reader_test --selftest [--dir D] | --gguf SHARD2 [--rows N] [--tokens F]\n"); return 2; }
+        else if (a == "--ram") ram = true;
+        else { std::fprintf(stderr,
+                            "usage: ple_reader_test --selftest [--dir D] | --gguf SHARD2 [--rows N] [--tokens F] [--ram]\n");
+               return 2; }
     }
     if (self) return selftest(dir);
-    if (!gguf.empty()) return real(gguf, rows, tokens, inflight, direct_first, direct_only, sync_submit);
+    if (!gguf.empty()) return real(gguf, rows, tokens, inflight, direct_first, direct_only, sync_submit, ram);
     std::fprintf(stderr, "nothing to do\n");
     return 2;
 }
