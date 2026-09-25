@@ -284,7 +284,10 @@ void PleTable::close() {
     }
 }
 
-bool PleTable::is_open() const { return impl_->data != nullptr || impl_->reader.is_open(); }
+bool PleTable::is_open() const {
+    // Ram mode holds no mapping and no reader: the resident buffer itself is the open state.
+    return impl_->data != nullptr || impl_->reader.is_open() || impl_->ram_base != nullptr;
+}
 PleIo PleTable::mode() const { return impl_->mode; }
 uint64_t PleTable::rows() const { return impl_->n_rows; }
 uint64_t PleTable::bytes_read() const { return impl_->bytes_read; }
