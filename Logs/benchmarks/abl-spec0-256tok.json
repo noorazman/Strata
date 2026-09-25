@@ -1,0 +1,31 @@
+{
+ "label": "abl-spec0-256tok",
+ "gpu": 0,
+ "workers": 28,
+ "max_new": 256,
+ "max_context": 8192,
+ "kv": "fp16",
+ "n_prompt": 29,
+ "wall_s": 0.5,
+ "engine_rc": 2,
+ "peak_vram_mib": 4,
+ "peak_gpu_util": 0,
+ "mem_before": {
+  "mem_total_gib": 125.77683639526367,
+  "mem_available_gib": 94.63096618652344,
+  "cached_gib": 72392557.19879532
+ },
+ "mem_after": {
+  "mem_total_gib": 125.77683639526367,
+  "mem_available_gib": 94.51595687866211,
+  "cached_gib": 72392577.19879532
+ },
+ "command_tail": "--expert-cache auto --prefill 2048 --spec 4 --spec-min-p 0.5 --pool-workers 28 --mtp mtp/rt --max-context 8192 --kv fp16 --max-new 256 --tokens 9419,11,821,803,369,7967,13,353,1044,264,11952,5617,303,220,17,15,17,21,13,10875,353,668,3184,488,883,821,1118,1834,13 --stats --spec 0",
+ "cpu": {
+  "cpu_total_mean_pct": 1.6,
+  "cpu_total_peak_pct": 4.1,
+  "cpu_core_mean_pct": 1.6,
+  "cpu_core_peak_pct": 90.0,
+  "cores_mean_ge50pct": []
+ }
+}

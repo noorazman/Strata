@@ -46,3 +46,7 @@ build-vision.bat
 /dist/
 *.done
 /third_party/*.zip
+
+# Stage 1.1: extensionless nsys sqlite exports (plan v0.3 P1: large dumps out of git;
+# regenerate with: nsys export --type sqlite -o Logs/gpu/<name> Logs/gpu/<name>.nsys-rep)
+Logs/gpu/nsys-*

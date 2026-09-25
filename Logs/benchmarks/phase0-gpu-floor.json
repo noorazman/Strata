@@ -1,0 +1,34 @@
+{
+ "workers": 28,
+ "mtp_mib": 808.0,
+ "label": "phase0-gpu-floor",
+ "gpu": 0,
+ "max_new": 16,
+ "max_context": 8192,
+ "kv": "fp16",
+ "n_prompt": 29,
+ "wall_s": 28.1,
+ "engine_rc": 1,
+ "peak_vram_mib": 18626,
+ "peak_gpu_util": 95,
+ "mem_before": {
+  "mem_total_gib": 125.77683639526367,
+  "mem_available_gib": 95.09695816040039,
+  "cached_gib": 74617516.62692642
+ },
+ "mem_after": {
+  "mem_total_gib": 125.77683639526367,
+  "mem_available_gib": 94.97066497802734,
+  "cached_gib": 74617640.6268959
+ },
+ "command_tail": "--expert-cache auto --prefill 2048 --spec 4 --spec-min-p 0.5 --pool-workers 28 --mtp mtp/rt --max-context 8192 --kv fp16 --max-new 16 --tokens 9419,11,821,803,369,7967,13,353,1044,264,11952,5617,303,220,17,15,17,21,13,10875,353,668,3184,488,883,821,1118,1834,13 --gpu-only-full",
+ "cpu": {
+  "cpu_total_mean_pct": 7.3,
+  "cpu_total_peak_pct": 54.2,
+  "cpu_core_mean_pct": 7.3,
+  "cpu_core_peak_pct": 100.0,
+  "cores_mean_ge50pct": [
+   "55:62%"
+  ]
+ }
+}
