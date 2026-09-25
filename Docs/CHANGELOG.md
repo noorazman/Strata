@@ -2,6 +2,16 @@
 
 Important historical changes and decisions. No raw logs.
 
+## 2026 — V100 Stage 1.2B (branch `stage1.2b-ple-ram-default`, from `stage1.2a-ple-ram` @ `stage1.2a-ple-ram-pass`)
+
+Made `--ple-io ram` the DEFAULT PLE storage mode (the 1.2A validation made it the preferred configuration on this 128 GB machine). Narrow stage: default flip + documentation + low-RAM guard; no engine/quant/expert-cache/pool/spec/KV/dense changes, no new performance work. Doc: `Docs/v100-stage1.2b-final.md`.
+
+- **Default is canonical in one place:** `Options::ple_io = "ram"` in `src/program/generate.cpp` (the kernel API `PleIoOptions::mode` keeps its low-RAM `Direct` default for library callers). A new ctest `ple_default_mode` pins the program default by asserting the help text shows `ram (default)` with `direct` and `mmap` still selectable. Explicit `--ple-io ram|direct|mmap` (and `--ple-ram`) always override; nothing auto-switches modes on detected RAM.
+- **Mode is logged:** startup now prints `PLE on, table N rows of SHARD (PLE I/O mode: ram|direct|mmap)` so every log states the active mode unambiguously.
+- **Low-RAM guard, no silent fallback:** before the preload, `PleTable::open` (Ram) requires total system RAM (MemTotal) >= PLE table + `ram_rest_bytes`, where the program supplies 42 GiB (expert arena ~40 GiB measured + 2 GiB headroom; 1.2A measured 67.5 GiB total peak RSS with the table resident). On a short machine the run fails BEFORE preloading with an actionable error naming the fallback (`use --ple-io direct on lower-RAM systems`); a failed anonymous allocation names it too. `ple_reader_test --gguf SHARD --ram --ram-rest-gb N` exercises the guard end-to-end against the real 26.82 GiB table without consuming RAM.
+- **All four paths validated** (GPU0, workers 24, Stage 1.1 deterministic workload): no-flag (ram default), `--ple-io ram`, `--ple-io direct` (its 4,488-read/18.8 MB decode I/O intact), `--ple-io mmap` — all 32/32 golden and token-for-token identical. Default-mode performance matches the 1.2A RAM results (prefill 406.2 tok/s chunk, TTFT 6.15 s; decode 42.2–44.0 tok/s; peak RSS 67.55 GiB; peak VRAM unchanged; PLE NVMe reads at inference 0).
+- **Environment note:** the system `/usr/bin/cmake` is 3.22.1 (rejects the project's `cmake_minimum_required(3.24)`); the working reconfigure used `~/.local/bin/cmake` (4.4.2).
+
 ## 2026 — V100 Stage 1.2A (branch `stage1.2a-ple-ram`, from `stage1.1-performance` c16ec22; Stage 1.1 and Stage 1 baselines untouched)
 
 RAM-resident PLE investigation: is the PLE storage path unnecessarily NVMe-bound, and can this machine's 128 GB RAM eliminate it? Deliverables: `Docs/ple-ram-analysis.md`, `Docs/v100-stage1.2a-final.md`, `Docs/v100-performance.md` (appended), engine `--ple-io ram`, bench helpers, raw data under `Logs/`.

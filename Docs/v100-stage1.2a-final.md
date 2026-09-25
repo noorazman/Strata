@@ -167,6 +167,10 @@ Stage 1.1 behavior; use `--ple-io ram` in the run scripts for this machine.
 Do NOT modify the decode engine (wait_flag_ge / CUDA events / verify window /
 pool dequant / expert cache / dense support) — untouched in this branch.
 
+(Stage 1.2B then made `ram` the PROGRAM default on this machine, with
+`direct` kept as the explicit lower-RAM fallback and a clear before-preload
+error on short machines — see `Docs/v100-stage1.2b-final.md`.)
+
 ## Next optimization (NOT started)
 
 Prefill is now ~80 %+ GPU-busy: the remaining terms are the CPU expert pool

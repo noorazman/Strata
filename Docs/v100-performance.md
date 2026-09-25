@@ -172,3 +172,17 @@ the last of the model's components still touching NVMe at inference; the expert
 blobs were already RAM-resident (pinned arena, loaded once at startup).
 Recommendation: keep `direct` as the default (64 GB machines); use
 `--ple-io ram` on this 128 GB box.
+
+## Stage 1.2B — `--ple-io ram` is now the default (branch `stage1.2b-ple-ram-default`)
+
+The 1.2A recommendation is adopted as the program default: `strata` with no
+`--ple-io` runs in RAM mode (canonical default: `Options::ple_io` in
+`src/program/generate.cpp`; pinned by the `ple_default_mode` ctest).
+`--ple-io direct` (lower-RAM fallback) and `--ple-io mmap` (alternative/test)
+are unchanged and explicit selection always wins. Startup logs the active mode
+(`PLE I/O mode: ram`), and a low-RAM guard fails clearly before the preload on
+machines short of table + ~42 GiB (naming `--ple-io direct`) instead of
+switching modes silently. All four modes re-validated: 32/32 golden,
+token-identical; default-mode numbers match the 1.2A RAM results (prefill
+406.2 tok/s chunk / TTFT 6.15 s, decode 42.2–44.0 tok/s, peak RSS 67.55 GiB,
+zero PLE NVMe at inference). Full write-up: `Docs/v100-stage1.2b-final.md`.
