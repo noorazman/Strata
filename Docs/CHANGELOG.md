@@ -10,6 +10,7 @@ Important historical changes and decisions. No raw logs.
 - `12979f4` **dangling-else fix** (`src/kernels/cpu/pool.cpp`) — the `else` after the `sched_getaffinity` branch bound to the inner `if (CPU_ISSET(...))`; on success the fallback core list was pushed once per UNSET mask bit → 54,263 "cores" / pool workers on a 56-CPU machine (~15-minute startup hang in `clone3`). Fixed with two braces. Root-cause repro kept in `/tmp/pool_repro*.cpp`.
 - `fa146c9` **Stage 1 docs** — testing (determinism + llama.cpp token-level cross-check: 32/32 identical on the primary prompt), benchmarks (prefill ~400 tok/s; sustained decode 37–40 tok/s; peak VRAM 18.3/15.6 GiB on 32/16 GB), final report (PASS).
 - **Fork + PR** — forked to `noorazman/Strata`; branch pushed; PR **Niko1221/Strata#3** opened against `main` (maintainer_can_edit). Local clone `/home/noorazman/dsh/strata/Strata` kept pristine (remote `local-mirror`).
+- **PR closed at user request** — user wants the build local and the repo private *for now*; PR Niko1221/Strata#3 closed, no upstream pushes. Fork left public (GitHub forbids making a public fork private without unforking first — deferred). Branch `feature/v100-moe` remains on `origin`, so the PR can be reopened or a new one opened anytime.
 
 ### Decisions of record
 - Model for Stage 1: user's Swift-1.5 IQ3_XXS GGUF (no downloads).

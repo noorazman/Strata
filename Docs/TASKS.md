@@ -1,10 +1,11 @@
 # TASKS
 
 ## NOW
-- (idle) Stage 1 complete; PR open. No active work.
+- (idle) Stage 1 complete; PR closed; build local. No active work.
 
 ## NEXT
-- Watch Niko1221/Strata#3 for review/CI; apply requested changes on `feature/v100-moe`, push to `origin` (noorazman/Strata).
+- On user request: reopen/replace the upstream PR (branch `feature/v100-moe` is on `origin`), or start Stage 2.
+- Optional housekeeping: make `noorazman/Strata` private later (Settings → Unfork → change visibility; API unfork needs admin token scope).
 
 ## LATER
 - Stage 2 candidates (only after Stage 1 merges / user direction): dense-model path, multi-GPU, additional quants, scheduler/memory rewrites, new API frameworks.

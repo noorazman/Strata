@@ -1,13 +1,14 @@
 # STATE
 
 ## Current phase
-V100 Stage 1 — COMPLETE (verdict PASS). Awaiting upstream review of the PR.
+V100 Stage 1 — COMPLETE (verdict PASS). PR closed at user request; build kept local, fork kept as-is.
 
 ## Current commit
-`dd63449` on branch `feature/v100-moe` (content commits: `fa146c9` docs, `12979f4` fix, `ae7b4fb` ctest, `6bb6b94` sm70, `5f75af7` baseline; state files at `dd63449`)
-- pushed to `origin` = `https://github.com/noorazman/Strata` (own fork of `Niko1221/Strata`)
-- open PR: **Niko1221/Strata#3** (base `main`, maintainer_can_edit=true)
-- remotes in this repo: `origin`=noorazman/Strata (fork), `upstream`=Niko1221/Strata, `local-mirror`=/home/noorazman/dsh/strata/Strata (DO NOT commit there — user's pristine clone of upstream)
+`feature/v100-moe` head — this commit updates the state files (previous head `97dc5e4`; content commits: `fa146c9` docs, `12979f4` fix, `ae7b4fb` ctest, `6bb6b94` sm70, `5f75af7` baseline). Verify with `git log --oneline -3`.
+- `origin` = `https://github.com/noorazman/Strata` (own fork of `Niko1221/Strata`) — **public for now** (user decision; to make private later: Settings → Unfork → then switch visibility, or API unfork needs admin scope)
+- **PR Niko1221/Strata#3: CLOSED** (user does not want to push upstream yet) — do NOT open/push to `upstream` without explicit request
+- remotes: `origin`=noorazman/Strata, `upstream`=Niko1221/Strata, `local-mirror`=/home/noorazman/dsh/strata/Strata (DO NOT commit there — user's pristine clone of upstream)
+- Local build: `build-sm70` in this repo
 
 ## Status
 - Build: `build-sm70` green. in-tree tests 20/21; ctest 19/20 on V100 (`ple_parity` red by design — needs Q2_0 fixtures).
@@ -50,4 +51,4 @@ CUDA_VISIBLE_DEVICES=0 LD_LIBRARY_PATH=/usr/local/cuda/lib64 timeout 900 ./build
 5. Notifications: `~/.dsh/bin/dsh-notify "text"` at milestones (Telegram bot may report offline — mention once, keep using).
 
 ## Next action (exactly one)
-Watch PR Niko1221/Strata#3 for review comments/CI; on feedback, revise on `feature/v100-moe` in this repo, commit, push to `origin`, and update this file.
+Idle until user direction: Stage 2 work, or re-push the branch (PR can be reopened from the fork at any time — branch `feature/v100-moe` is already on `origin`).
