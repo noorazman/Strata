@@ -2,6 +2,18 @@
 
 Important historical changes and decisions. No raw logs.
 
+## 2026 — V100 Stage 1.2A (branch `stage1.2a-ple-ram`, from `stage1.1-performance` c16ec22; Stage 1.1 and Stage 1 baselines untouched)
+
+RAM-resident PLE investigation: is the PLE storage path unnecessarily NVMe-bound, and can this machine's 128 GB RAM eliminate it? Deliverables: `Docs/ple-ram-analysis.md`, `Docs/v100-stage1.2a-final.md`, `Docs/v100-performance.md` (appended), engine `--ple-io ram`, bench helpers, raw data under `Logs/`.
+
+- **Finding: the PLE n-gram table (26.82 GiB, 320,001,536 rows × 90 B IQ4_NL, in shard 1) is the last model component that touches NVMe at inference.** The 39.97 GiB expert blobs were already RAM-resident (pinned arena, loaded once at startup; RAM→GPU at runtime). PLE moved 85.2 MB / 20,376 O_DIRECT reads (prefill, p50 7.9 ms, 2,520 ms blocked) + 18.8 MB (decode, p50 3.8 ms, p99 64 ms) per benchmark — synchronous on the host critical path (one serialized-read worker thread; "64 in flight" = a queue of serialized preads, not parallelism).
+- **Why O_DIRECT was the design:** 64 GB-RAM policy — the table must never occupy RAM/page cache; engine keeps a bounded 95 MB row cache instead. Documented in-code; not an I/O-scheduling quirk. On 128 GB the constraint is looser — measured.
+- **Implementation (opt-in, SSD default kept):** `PleIo::Ram` + `--ple-io ram` / `--ple-ram` / `--ple-ram-threads`. One-time preload of the validated table region into an anonymous mmap buffer (multi-threaded buffered preads, timed, reported at startup); `issue/collect/gather_batch` serve rows by memcpy through the same dequant and zeroing; mapping released like Direct. `PleTable::is_open()` treats the resident buffer as open state.
+- **Measured (workers 24, deterministic Stage 1.1 workload, NVMe counters device-level per run):** GPU0 32 GB — prefill 7,477.6→4,869.9 ms (273.6→420.1 tok/s, −35 %), TTFT 8,036→5,472 ms, decode 35.4→44.7/42.2 tok/s (+19–26 %); GPU4 16 GB — prefill 7,683.9→4,470.9 ms (266.3→457.6 tok/s), decode 35.4→40.0 tok/s (+13 %). PLE NVMe at inference: 20,376 reads/85.2 MB → **0** (diskstats: RAM run's device reads = arena + preload only). Peak VRAM unchanged (18,852 / 16,133 MiB); GPU busy during prefill 53 % → 75–89 % (no longer I/O-starved).
+- **Cost:** process peak RSS ~42 → **67.5 GiB** (1 Hz VmRSS sampling; arena 39.97 + PLE 26.82 + 0.7), ~44 GiB headroom on 125.78 GiB; preload 2.33 s @ 11.49 GiB/s from page cache / 16.9–28.5 s cold @ 1.0–1.6 GiB/s.
+- **Correctness:** table-level bit-identity mmap = direct = ram over 52,752 rows (`ple_reader_test --gguf --ram`, including straddle/out-of-range); 32/32 golden on BOTH cards in BOTH modes; SSD and RAM token-for-token identical; expert-cache hit/miss, spec and pool stats identical between arms.
+- **Recommendation:** keep `direct` as the default (64 GB machines); use `--ple-io ram` on this 128 GB box. Hot/cold caching deferred (per-prompt rows ~99.2 % unique — a hot set doesn't persist across prompts). Decode engine untouched (wait_flag_ge, CUDA events, verify window, pool dequant, expert cache, dense support) per stage scope.
+
 ## 2025 — V100 Stage 1.1 (branch `stage1.1-performance`, from `4b34188`; Stage 1 baseline `fa146c9`, tag `stage1-v100-moe-pass`)
 
 Performance optimization, no engine changes. Deliverables: `Docs/v100-{cpu-analysis,gpu-analysis,vram-analysis,performance,stage1.1-final}.md`, `bench/v100/` harness, raw data under `Logs/{benchmarks,cpu,gpu}` (large captures gitignored; sqlite regenerable via `nsys export --type sqlite`).

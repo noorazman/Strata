@@ -142,3 +142,33 @@ From the nsys MEMCPY records (decode window, 7.04 s):
   hangs; deterministic output (identical token sequences run-to-run for the
   same config; first divergence across GPU0/4 at token 6 as expected).
 - Peak VRAM stable: 18,852–18,896 MiB (GPU0), 16,111–16,133 MiB (GPU4).
+
+## Stage 1.2A — RAM-resident PLE (branch `stage1.2a-ple-ram`, from c16ec22)
+
+Full write-up: `Docs/v100-stage1.2a-final.md`; analysis: `Docs/ple-ram-analysis.md`.
+`--ple-io ram` (new, opt-in, default stays `direct`): the 26.82 GiB PLE table is
+preloaded once at startup into RAM (2.3 s warm / 17–28 s cold) and served by
+memcpy instead of 4 KiB O_DIRECT preads. Same deterministic workload as the
+Stage 1.1 matrix (workers 24; prefill = 2,047-token prompt; decode = 256 tokens).
+
+| metric, GPU0 32 GB | SSD `direct` | RAM `--ple-io ram` |
+|---|---:|---:|
+| prefill 2046 tokens | 7,477.6 ms (273.6 tok/s) | **4,869.9 ms (420.1 tok/s, −35 %)** |
+| prefill end-to-end | 267.4 tok/s | **406.6 tok/s (+52 %)** |
+| TTFT | 8,035.6 ms | **5,471.5 ms (−2.56 s)** |
+| PLE NVMe reads at inference | 20,376 / 85.2 MB | **0** (device-level verified) |
+| decode 256 tokens | 35.38 / 35.50 tok/s | **44.69 / 42.24 tok/s (+19–26 %)** |
+| peak VRAM | 18,852 MiB | 18,852 MiB (unchanged) |
+| process peak RSS | ~42 GiB | **67.5 GiB** (measured; 125.78 GiB machine, ~44 GiB headroom) |
+
+16 GB (GPU4): prefill 260.9 tok/s → **418–441 tok/s** (+60–68 %), decode
+35.43 → **40.04 tok/s** (+13 %), peak VRAM 16,133 MiB unchanged, 6,321-slot
+cache and hit rate identical.
+
+Correctness: table-level bit-identity (mmap = direct = ram, 52,752 rows,
+`ple_reader_test --gguf --ram`); 32/32 golden reproduced on BOTH cards in BOTH
+modes; token-for-token identical across SSD/RAM. The PLE table (26.82 GiB) was
+the last of the model's components still touching NVMe at inference; the expert
+blobs were already RAM-resident (pinned arena, loaded once at startup).
+Recommendation: keep `direct` as the default (64 GB machines); use
+`--ple-io ram` on this 128 GB box.

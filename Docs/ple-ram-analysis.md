@@ -115,10 +115,10 @@ Budget with the PLE table made RAM-resident (+26.82 GiB):
 | Strata: expert arena (pinned) | 39.97 |
 | Strata: PLE table (NEW, anonymous mmap) | 26.82 |
 | Strata: mmap'd weights (pack + projections + embedding, page-cache-backed) | ~3.5 |
-| Strata: KV host buffers, activations, pinned staging, engine overhead | ~1–2 |
-| **Expected peak RSS of the process** | **~45–47** |
+| Strata: KV host buffers, activations, pinned staging, engine overhead | ~0.7 (measured residual) |
+| **Expected peak RSS of the process** | **~45–47** (estimate) → **67.5 GiB measured** (1 Hz VmRSS sampling of a RAM-mode run: arena 39.97 + PLE 26.82 + ~0.7) |
 | Total RAM | 125.78 |
-| **Headroom after peak** | **~78 GiB** (plus ~72 GiB of reclaimable page cache) |
+| **Headroom after peak** | **~44 GiB** (plus reclaimable page cache) |
 
 The 26.82 GiB preload also warms the page cache with the table region; those
 pages are reclaimable, so the worst-case footprint is still ~47 GiB process +
