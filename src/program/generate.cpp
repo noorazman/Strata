@@ -106,11 +106,13 @@ struct Options {
     /// <=256-token attention adapter. It becomes the default once P0 shows it is not slower.
     std::string native_preset;
     /// Plan v0.3 P2: how the n-gram table is read. Direct (default) = unbuffered SSD reads, table never in RAM.
+    /// Ram (Stage 1.2A) = preload the whole table into RAM at startup; inference reads it from RAM.
     std::string ple_io = "direct";
     int64_t ple_row_cache = 1 << 20;   ///< bounded row cache (rows of 90 B); 0 disables
     int ple_inflight = 64;
     double ple_delay_us = 0;           ///< fault injection: every row read completes no earlier than this
     bool ple_sync_submit = false;      ///< A/B arm: submit reads on the token thread, no I/O worker
+    int ple_ram_threads = 16;          ///< Ram mode: preload read threads (1 = single-threaded)
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
@@ -242,8 +244,10 @@ void usage() {
                  "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
                  "  --ple-gguf PATH      required PLE table (original second GGUF shard)\n"
                  "  --no-ple             explicit diagnostic ablation of the PLE layer\n"
-                 "  --ple-io direct|mmap  n-gram table reads (plan v0.3 P2). direct (default): unbuffered SSD\n"
-                 "                       reads, the table never enters RAM or the file cache; mmap: A/B arm\n"
+                 "  --ple-io direct|mmap|ram  n-gram table reads. direct (default): unbuffered SSD reads, the\n"
+                 "                       table never enters RAM or the file cache; mmap: A/B arm; ram (Stage 1.2A):\n"
+                 "                       preload the whole 26.8 GiB table into system RAM at startup and read it\n"
+                 "                       from RAM (no --ple-ram alias); preload threads: --ple-ram-threads N\n"
                  "  --ple-row-cache N    bounded cache of fetched rows, 90 B each (default 1048576; 0 = off)\n"
                  "  --ple-inflight N     outstanding SSD reads (default 64)\n"
                  "  --ple-delay-us U     fault injection: each row read completes no earlier than U us\n"
@@ -488,6 +492,8 @@ int main(int argc, char** argv) {
         else if (a == "--ple-gguf") o.ple_gguf = next("--ple-gguf");
         else if (a == "--no-ple") o.no_ple = true;
         else if (a == "--ple-io") o.ple_io = next("--ple-io");
+        else if (a == "--ple-ram") o.ple_io = "ram";
+        else if (a == "--ple-ram-threads") o.ple_ram_threads = std::atoi(next("--ple-ram-threads"));
         else if (a == "--ple-row-cache") o.ple_row_cache = std::atoll(next("--ple-row-cache"));
         else if (a == "--ple-inflight") o.ple_inflight = std::atoi(next("--ple-inflight"));
         else if (a == "--ple-delay-us") o.ple_delay_us = std::atof(next("--ple-delay-us"));
@@ -587,9 +593,12 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    if ((o.ple_io != "direct" && o.ple_io != "mmap") || o.ple_row_cache < 0 || o.ple_inflight < 1 ||
-        o.ple_inflight > 1024 || !(o.ple_delay_us >= 0)) {
-        std::fprintf(stderr, "strata generate: invalid --ple-io/--ple-row-cache/--ple-inflight/--ple-delay-us\n");
+    if ((o.ple_io != "direct" && o.ple_io != "mmap" && o.ple_io != "ram") || o.ple_row_cache < 0 ||
+        o.ple_inflight < 1 || o.ple_inflight > 1024 || !(o.ple_delay_us >= 0) || o.ple_ram_threads < 1 ||
+        o.ple_ram_threads > 64) {
+        std::fprintf(stderr,
+                     "strata generate: invalid --ple-io/--ple-ram-threads/--ple-row-cache/--ple-inflight/"
+                     "--ple-delay-us\n");
         return 2;
     }
     if (o.kv != "fp16" && o.kv != "int8") {
@@ -871,13 +880,19 @@ int main(int argc, char** argv) {
     float* ple_scratch = nullptr;
     if (!o.ple_gguf.empty()) {
         strata::kernels::PleIoOptions pio;
-        pio.mode = o.ple_io == "mmap" ? strata::kernels::PleIo::Mmap : strata::kernels::PleIo::Direct;
+        pio.mode = o.ple_io == "mmap" ? strata::kernels::PleIo::Mmap
+                 : o.ple_io == "ram"  ? strata::kernels::PleIo::Ram
+                                      : strata::kernels::PleIo::Direct;
         pio.max_inflight = (uint32_t) o.ple_inflight;
         pio.cache_rows = (uint64_t) o.ple_row_cache;
         pio.io_thread = !o.ple_sync_submit;
+        pio.ram_threads = (uint32_t) o.ple_ram_threads;
         if (!ple_table.open(o.ple_gguf, err, pio)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
+        }
+        if (!ple_table.preload_report().empty()) {
+            std::fprintf(stderr, "strata generate: %s\n", ple_table.preload_report().c_str());
         }
         const strata::core::WeightRef* wk = wt.find("blk.1.ple_key.weight");
         const strata::core::WeightRef* wv = wt.find("blk.1.ple_value.weight");

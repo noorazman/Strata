@@ -98,18 +98,22 @@ void iq4nl_dequant_row(const uint8_t* row, float* out160);
 
 /// How the table's rows are read (plan v0.3 P2). `Direct` is the default: unbuffered 4 KiB reads from the SSD,
 /// so the table never occupies RAM or the OS file cache. `Mmap` is the earlier memory-mapped path, kept as the
-/// A/B arm; it returns the same bytes.
+/// A/B arm; it returns the same bytes. `Ram` (Stage 1.2A): at open the whole table is preloaded into an
+/// anonymous RAM buffer; issue/collect become synchronous copies out of that buffer, and the file is never
+/// mapped after open. Same bytes, no table I/O at inference time; the cost is the preload (measured and
+/// reported by `preload_report` / `io_report`).
 ///
 /// NEVER KEEP THE SHARD MAPPED WHILE READING IT DIRECT: a live section on the same file serializes the unbuffered
-/// reads (311 -> 1,575 us per token, bench/results/2026-09-23-p2-ssd-direct). Direct mode drops its own mapping
-/// after the header parse; nothing else in the process may hold one.
-enum class PleIo { Direct, Mmap };
+/// reads (311 -> 1,575 us per token, bench/results/2026-09-23-p2-ssd-direct). Direct and Ram modes both drop
+/// their own mapping after the header parse; nothing else in the process may hold one.
+enum class PleIo { Direct, Mmap, Ram };
 
 struct PleIoOptions {
     PleIo mode = PleIo::Direct;
     uint32_t max_inflight = 64;      ///< outstanding SSD reads (decode needs 16; prefill chunks use more)
     uint64_t cache_rows = 1u << 20;  ///< bounded row cache: 1,048,576 rows x 90 B ~ 95 MB; 0 disables
     bool io_thread = true;           ///< reads submitted by a worker thread, not the caller
+    uint32_t ram_threads = 16;       ///< Ram mode: preload read threads (1 = single-threaded)
 };
 
 /// The PLE table.  Held by pointer-to-impl so this header does not drag `<windows.h>` into every
@@ -157,8 +161,11 @@ public:
     /// Bytes actually touched since `open`, for the "how often is it not ready" measurement P2.S4 asks for.
     uint64_t bytes_read() const;
 
-    /// One line of reader statistics (Direct mode), e.g. for --stats. Empty in Mmap mode.
+    /// One line of reader statistics (Direct mode), e.g. for --stats. Empty in Mmap mode. In Ram mode it
+    /// reports the resident table and the rows served from it.
     std::string io_report() const;
+    /// Ram mode only: the preload line (size, time, rate). Empty in the other modes.
+    std::string preload_report() const;
     PleIo mode() const;
 
 private:

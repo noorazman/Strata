@@ -6,8 +6,11 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/ngram/ple_reader.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <vector>
 #include <stdexcept>
 
@@ -16,6 +19,10 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 namespace strata::kernels {
@@ -115,12 +122,19 @@ struct PleTable::Impl {
     mutable uint64_t bytes_read = 0;
     // Direct mode (plan v0.3 P2): the mapping above is released after the header parse and every row comes
     // from an unbuffered SSD read into `raw`.
+    // Ram mode (Stage 1.2A): `ram_base` holds the WHOLE table in anonymous RAM after a measured preload; the
+    // mapping is released like in Direct, so nothing else in the process touches the file during inference.
+    // `ram_requests` counts rows served from RAM (the Ram analogue of `requests` in ReaderStats).
     PleIo mode = PleIo::Mmap;
     strata::ngram::PleReader reader;
     strata::ngram::PleReader::Ticket ticket;
     bool pending = false;
     uint32_t rows[PLE_N_HEADS] = {};
     uint8_t raw[PLE_N_HEADS * PLE_ROW_BYTES] = {};
+    uint8_t* ram_base = nullptr;
+    uint64_t ram_bytes = 0;
+    uint64_t ram_requests = 0;
+    double preload_s = 0;
 };
 
 PleTable::PleTable() : impl_(new Impl) {}
@@ -195,6 +209,60 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         }
         impl_->n_rows = n_rows;
     }
+    if (io.mode == PleIo::Ram) {
+        // Stage 1.2A: the parse above is the validated source of the offset; the preload copies the table
+        // region into anonymous RAM, and the mapping is released afterwards, exactly as in Direct mode.
+        // Buffered preads (page-cache-backed): the data is resident in THIS process afterwards, so there is
+        // nothing the cache copy can compete with here; the cache pages themselves are reclaimable.
+        const uint64_t table_offset = impl_->file->data_start() + t->offset;
+        const uint64_t n_rows = impl_->n_rows;
+        const uint64_t bytes = n_rows * (uint64_t) PLE_ROW_BYTES;
+        const int fd = ::open(gguf_path.c_str(), O_RDONLY);
+        if (fd < 0) { err = "PleTable: cannot open " + gguf_path + " for the RAM preload"; close(); return false; }
+        void* base = mmap(nullptr, (size_t) bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (base == MAP_FAILED) {
+            ::close(fd);
+            err = "PleTable: cannot allocate " + std::to_string(bytes) + " bytes for the RAM table";
+            close();
+            return false;
+        }
+        std::atomic<bool> bad{false};
+        auto fill_slice = [&](uint64_t lo, uint64_t hi) {
+            for (uint64_t off = lo; off < hi && !bad; off += ((uint64_t) 1) << 26) {
+                const uint64_t n = std::min<uint64_t>(((uint64_t) 1) << 26, hi - off);
+                if (pread(fd, (uint8_t*) base + off, (size_t) n, (off_t) (table_offset + off)) != (ssize_t) n)
+                    bad = true;
+            }
+        };
+        const auto t0 = std::chrono::steady_clock::now();
+        const uint64_t nthreads = std::max<uint64_t>(1, std::min<uint64_t>((uint64_t) io.ram_threads, 64));
+        if (nthreads == 1) {
+            fill_slice(0, bytes);
+        } else {
+            const uint64_t slice = (bytes + nthreads - 1) / nthreads;
+            std::vector<std::thread> pool;
+            for (uint64_t i = 1; i < nthreads; ++i)
+                pool.emplace_back([&, i] { fill_slice(i * slice, std::min(bytes, (i + 1) * slice)); });
+            fill_slice(0, slice);
+            for (auto& th : pool) th.join();
+        }
+        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (bad) {
+            munmap(base, (size_t) bytes);
+            ::close(fd);
+            err = "PleTable: the RAM preload read short of the table region";
+            close();
+            return false;
+        }
+        ::close(fd);
+        delete impl_->file;
+        impl_->file = nullptr;
+        impl_->data = nullptr;
+        impl_->ram_base = (uint8_t*) base;
+        impl_->ram_bytes = bytes;
+        impl_->preload_s = secs;
+        impl_->n_rows = n_rows;
+    }
     impl_->mode = io.mode;
     return true;
 }
@@ -207,6 +275,13 @@ void PleTable::close() {
     impl_->file = nullptr;
     impl_->data = nullptr;
     impl_->n_rows = 0;
+    if (impl_->ram_base != nullptr) {
+        munmap(impl_->ram_base, (size_t) impl_->ram_bytes);
+        impl_->ram_base = nullptr;
+        impl_->ram_bytes = 0;
+        impl_->ram_requests = 0;
+        impl_->preload_s = 0;
+    }
 }
 
 bool PleTable::is_open() const { return impl_->data != nullptr || impl_->reader.is_open(); }
@@ -227,6 +302,16 @@ void PleTable::read_row(uint32_t row, float* out160) const {
         impl_->bytes_read += PLE_ROW_BYTES;
         return;
     }
+    if (impl_->mode == PleIo::Ram && impl_->ram_base != nullptr) {
+        if (row >= impl_->n_rows) {
+            std::memset(out160, 0, (size_t) PLE_HEAD_DIM * sizeof(float));
+            return;
+        }
+        iq4nl_dequant_row(impl_->ram_base + (size_t) row * PLE_ROW_BYTES, out160);
+        impl_->bytes_read += PLE_ROW_BYTES;
+        ++impl_->ram_requests;
+        return;
+    }
     if (impl_->data == nullptr || row >= impl_->n_rows) {
         std::memset(out160, 0, (size_t) PLE_HEAD_DIM * sizeof(float));
         return;
@@ -240,6 +325,20 @@ bool PleTable::issue(const uint32_t* rows16) {
     if (impl_->mode == PleIo::Direct) {
         if (impl_->pending) return false;              // one token in flight per table
         impl_->ticket = impl_->reader.issue(impl_->rows, PLE_N_HEADS, impl_->raw);
+        impl_->pending = true;
+        return true;
+    }
+    if (impl_->mode == PleIo::Ram) {
+        // Synchronous: the rows come out of the resident table, so `issue` is done by the time it returns and
+        // `collect` only dequantizes. Out-of-range rows are zeros, the Direct and Mmap behaviour.
+        if (impl_->pending) return false;
+        for (int h = 0; h < PLE_N_HEADS; ++h) {
+            const uint32_t r = impl_->rows[h];
+            if (r >= impl_->n_rows) std::memset(impl_->raw + (size_t) h * PLE_ROW_BYTES, 0, PLE_ROW_BYTES);
+            else std::memcpy(impl_->raw + (size_t) h * PLE_ROW_BYTES,
+                             impl_->ram_base + (size_t) r * PLE_ROW_BYTES, PLE_ROW_BYTES);
+            ++impl_->ram_requests;
+        }
         impl_->pending = true;
         return true;
     }
@@ -270,6 +369,13 @@ bool PleTable::collect(float* out2560, std::string& err) {
         impl_->bytes_read += (uint64_t) PLE_N_HEADS * PLE_ROW_BYTES;
         return true;
     }
+    if (impl_->mode == PleIo::Ram) {
+        // `issue` already copied the rows out of the resident table; only the dequantize remains.
+        for (int h = 0; h < PLE_N_HEADS; ++h)
+            iq4nl_dequant_row(impl_->raw + (size_t) h * PLE_ROW_BYTES, out2560 + (size_t) h * PLE_HEAD_DIM);
+        impl_->bytes_read += (uint64_t) PLE_N_HEADS * PLE_ROW_BYTES;
+        return true;
+    }
     for (int h = 0; h < PLE_N_HEADS; ++h) read_row(impl_->rows[h], out2560 + (size_t) h * PLE_HEAD_DIM);
     return true;
 }
@@ -285,6 +391,21 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
         impl_->bytes_read += (uint64_t) n * PLE_ROW_BYTES;
         return true;
     }
+    if (impl_->mode == PleIo::Ram) {
+        // The whole chunk's rows out of the resident table: one memcpy per row, then the same dequantize the
+        // Direct path runs. This is the prefill/verify replacement for the batched O_DIRECT ticket.
+        std::vector<uint8_t> raw(n * PLE_ROW_BYTES);
+        for (size_t i = 0; i < n; ++i) {
+            const uint32_t r = rows[i];
+            if (r >= impl_->n_rows) std::memset(raw.data() + i * PLE_ROW_BYTES, 0, PLE_ROW_BYTES);
+            else std::memcpy(raw.data() + i * PLE_ROW_BYTES, impl_->ram_base + (size_t) r * PLE_ROW_BYTES,
+                             PLE_ROW_BYTES);
+            ++impl_->ram_requests;
+        }
+        for (size_t i = 0; i < n; ++i) iq4nl_dequant_row(raw.data() + i * PLE_ROW_BYTES, out + i * PLE_HEAD_DIM);
+        impl_->bytes_read += (uint64_t) n * PLE_ROW_BYTES;
+        return true;
+    }
     for (size_t i = 0; i < n; ++i) read_row(rows[i], out + i * PLE_HEAD_DIM);
     return true;
 }
@@ -292,6 +413,16 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
 void PleTable::set_injected_delay_us(double us) { impl_->reader.set_injected_delay_us(us); }
 
 std::string PleTable::io_report() const {
+    if (impl_->mode == PleIo::Ram) {
+        char buf[256];
+        const double gib = (double) impl_->ram_bytes / (double) (1ull << 30);
+        std::snprintf(buf, sizeof buf,
+                      "ple ram: %llu rows resident (%.2f GiB), preloaded in %.2f s (%.2f GiB/s); served %llu rows (%.1f MB) from RAM",
+                      (unsigned long long) impl_->n_rows, gib, impl_->preload_s,
+                      impl_->preload_s > 0 ? gib / impl_->preload_s : 0.0, (unsigned long long) impl_->ram_requests,
+                      (double) impl_->ram_requests * PLE_ROW_BYTES / 1e6);
+        return buf;
+    }
     if (impl_->mode != PleIo::Direct || !impl_->reader.is_open()) return {};
     const strata::ngram::ReaderStats& s = impl_->reader.stats();
     char buf[320];
@@ -305,9 +436,21 @@ std::string PleTable::io_report() const {
     return buf;
 }
 
+std::string PleTable::preload_report() const {
+    if (impl_->mode != PleIo::Ram || impl_->ram_base == nullptr) return {};
+    char buf[200];
+    const double gib = (double) impl_->ram_bytes / (double) (1ull << 30);
+    std::snprintf(buf, sizeof buf,
+                  "PLE ram: preloaded %llu rows (%.2f GiB) in %.2f s (%.2f GiB/s); RAM-resident for the whole run",
+                  (unsigned long long) impl_->n_rows, gib, impl_->preload_s,
+                  impl_->preload_s > 0 ? gib / impl_->preload_s : 0.0);
+    return buf;
+}
+
 void PleTable::gather(const uint32_t* rows16, float* out2560) const {
-    if (impl_->mode == PleIo::Direct) {
-        // `gather` stays const for its existing callers; the reader's state is the table's I/O state.
+    if (impl_->mode == PleIo::Direct || impl_->mode == PleIo::Ram) {
+        // `gather` stays const for its existing callers; the reader's (or the RAM table's) state is the table's
+        // I/O state. Ram's `issue`/`collect` are synchronous copies, so the split costs nothing here.
         PleTable* self = const_cast<PleTable*>(this);
         std::string err;
         if (!self->issue(rows16) || !self->collect(out2560, err)) {
