@@ -256,6 +256,13 @@ if(STRATA_ENABLE_CUDA)
   target_include_directories(strata PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill CUDA::cudart)
 
+  # Stage 1.2B: pins the CANONICAL PROGRAM default for the PLE storage mode (Options::ple_io in
+  # src/program/generate.cpp - the single authoritative place). `strata --help` exits before any model/GPU
+  # work, so this is cheap. The default must stay 'ram'; 'direct' and 'mmap' must remain selectable.
+  # (The usage text goes to stderr, so capture both streams.)
+  add_test(NAME ple_default_mode
+           COMMAND bash -c "h=$($<TARGET_FILE:strata> --help 2>&1); printf '%s\\n' \"$h\" | grep -q -- 'ram    (default)' && printf '%s\\n' \"$h\" | grep -q -- 'direct Read PLE data' && printf '%s\\n' \"$h\" | grep -q -- 'mmap   Memory-map'")
+
   add_executable(dequant_s2_parity src/kernels/dequant_s2_parity.cpp)
   # The tests are HOST C++ files that call cudaMalloc/cudaMemcpy themselves, so they need the toolkit headers
   # and cudart explicitly: enabling the CUDA language gives those to .cu sources automatically, but a .cpp

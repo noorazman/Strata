@@ -96,12 +96,17 @@ int iq4nl_code(int code);
 /// a perfectly plausible embedding of the wrong 160 values.
 void iq4nl_dequant_row(const uint8_t* row, float* out160);
 
-/// How the table's rows are read (plan v0.3 P2). `Direct` is the default: unbuffered 4 KiB reads from the SSD,
-/// so the table never occupies RAM or the OS file cache. `Mmap` is the earlier memory-mapped path, kept as the
-/// A/B arm; it returns the same bytes. `Ram` (Stage 1.2A): at open the whole table is preloaded into an
-/// anonymous RAM buffer; issue/collect become synchronous copies out of that buffer, and the file is never
-/// mapped after open. Same bytes, no table I/O at inference time; the cost is the preload (measured and
-/// reported by `preload_report` / `io_report`).
+/// How the table's rows are read (plan v0.3 P2). `Direct` is the unbuffered-SSD path: 4 KiB reads,
+/// the table never occupies RAM or the OS file cache. `Mmap` is the earlier memory-mapped path, kept as the
+/// alternative/testing arm; it returns the same bytes. `Ram` (Stage 1.2A): at open the whole table is
+/// preloaded into an anonymous RAM buffer; issue/collect become synchronous copies out of that buffer, and
+/// the file is never mapped after open. Same bytes, no table I/O at inference time; the cost is the preload
+/// (measured and reported by `preload_report` / `io_report`).
+///
+/// DEFAULT: the kernel API default (`PleIoOptions::mode`) is `Direct` - a library caller that asks for "the
+/// table" gets the low-RAM behavior. The PROGRAM default (what `strata` runs with when the user passes no
+/// --ple-io) is `Ram`, set in exactly one place: `Options::ple_io` in src/program/generate.cpp (Stage 1.2B).
+/// A ctest (`ple_default_mode`) pins the program default via the help text.
 ///
 /// NEVER KEEP THE SHARD MAPPED WHILE READING IT DIRECT: a live section on the same file serializes the unbuffered
 /// reads (311 -> 1,575 us per token, bench/results/2026-09-23-p2-ssd-direct). Direct and Ram modes both drop
@@ -114,6 +119,11 @@ struct PleIoOptions {
     uint64_t cache_rows = 1u << 20;  ///< bounded row cache: 1,048,576 rows x 90 B ~ 95 MB; 0 disables
     bool io_thread = true;           ///< reads submitted by a worker thread, not the caller
     uint32_t ram_threads = 16;       ///< Ram mode: preload read threads (1 = single-threaded)
+    /// Ram mode, Stage 1.2B: the system RAM the REST of the engine needs on top of the resident table
+    /// (expert arena, KV, activations, overhead). open() requires total system RAM >= table + ram_rest_bytes
+    /// BEFORE the preload and fails with a clear, actionable error (mentioning --ple-io direct) when it does
+    /// not - a low-RAM machine must get an error, never a silent mode switch. 0 = skip the check.
+    uint64_t ram_rest_bytes = 0;
 };
 
 /// The PLE table.  Held by pointer-to-impl so this header does not drag `<windows.h>` into every

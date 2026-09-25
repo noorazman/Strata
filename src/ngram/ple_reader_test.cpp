@@ -141,7 +141,7 @@ int selftest(const std::string& dir) {
 }
 
 int real(const std::string& gguf, int n_random, const std::string& tokens_path, uint32_t inflight, bool direct_first,
-         bool direct_only, bool sync_submit, bool ram) {
+         bool direct_only, bool sync_submit, bool ram, uint64_t ram_rest_gb) {
     k::PleTable mm, direct, rtab;
     std::string err;
     k::PleIoOptions mo;
@@ -155,9 +155,13 @@ int real(const std::string& gguf, int n_random, const std::string& tokens_path, 
     if (!direct_only && !mm.open(gguf, err, mo)) { std::fprintf(stderr, "mmap open: %s\n", err.c_str()); return 2; }
     if (!direct.open(gguf, err, dopt)) { std::fprintf(stderr, "direct open: %s\n", err.c_str()); return 2; }
     // Stage 1.2A arm: the whole table preloaded into RAM. Bit-identity against the other arms is the check.
+    // Stage 1.2B: --ram-rest-gb N makes the insufficient-RAM guard expect N GiB MORE than the table, so any
+    // machine under that total must fail open() with the clear --ple-io direct message (rc 2) BEFORE the
+    // preload runs - that failure IS the check.
     if (ram) {
         k::PleIoOptions ropt;
         ropt.mode = k::PleIo::Ram;
+        if (ram_rest_gb > 0) ropt.ram_rest_bytes = (uint64_t) ram_rest_gb << 30;
         if (!rtab.open(gguf, err, ropt)) { std::fprintf(stderr, "ram open: %s\n", err.c_str()); return 2; }
         std::fprintf(stderr, "%s\n", rtab.preload_report().c_str());
     }
@@ -238,6 +242,7 @@ int main(int argc, char** argv) {
     bool sync_submit = false;
     bool self = false;
     bool ram = false;
+    uint64_t ram_rest_gb = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--selftest") self = true;
@@ -250,12 +255,16 @@ int main(int argc, char** argv) {
         else if (a == "--direct-only") direct_only = true;
         else if (a == "--sync") sync_submit = true;
         else if (a == "--ram") ram = true;
+        else if (a == "--ram-rest-gb" && i + 1 < argc) ram_rest_gb = (uint64_t) std::atoi(argv[++i]);
         else { std::fprintf(stderr,
-                            "usage: ple_reader_test --selftest [--dir D] | --gguf SHARD2 [--rows N] [--tokens F] [--ram]\n");
+                            "usage: ple_reader_test --selftest [--dir D] | --gguf SHARD2 [--rows N] [--tokens F]\n"
+                            "       [--ram] [--ram-rest-gb N]  (N = GiB the rest of the engine needs ON TOP of the\n"
+                            "       table: the guard demands total RAM >= table + N, so a large N makes open fail\n"
+                            "       before the preload with the --ple-io direct hint)\n");
                return 2; }
     }
     if (self) return selftest(dir);
-    if (!gguf.empty()) return real(gguf, rows, tokens, inflight, direct_first, direct_only, sync_submit, ram);
+    if (!gguf.empty()) return real(gguf, rows, tokens, inflight, direct_first, direct_only, sync_submit, ram, ram_rest_gb);
     std::fprintf(stderr, "nothing to do\n");
     return 2;
 }

@@ -105,9 +105,14 @@ struct Options {
     /// combination recorded in bench/results/2026-09-23-attention-ple plus the native indexer, and never the
     /// <=256-token attention adapter. It becomes the default once P0 shows it is not slower.
     std::string native_preset;
-    /// Plan v0.3 P2: how the n-gram table is read. Direct (default) = unbuffered SSD reads, table never in RAM.
-    /// Ram (Stage 1.2A) = preload the whole table into RAM at startup; inference reads it from RAM.
-    std::string ple_io = "direct";
+    /// Plan v0.3 P2 / Stage 1.2B: how the n-gram table is read. **THIS IS THE CANONICAL PROGRAM DEFAULT** -
+    /// the single authoritative place the default PLE storage mode lives; the kernel API keeps its own
+    /// low-RAM default (see PleIoOptions in include/strata/kernels/ngram.hpp), and a ctest (ple_default_mode)
+    /// pins this one via the help text. Ram = preload the whole table into RAM at startup (validated on this
+    /// 128 GB machine in Stage 1.2A: prefill +52 %, zero PLE NVMe reads at inference, 32/32 golden); direct =
+    /// unbuffered SSD reads, table never in RAM (the lower-RAM fallback); mmap = alternative/testing mode.
+    /// An explicit --ple-io always overrides the default; nothing auto-switches modes.
+    std::string ple_io = "ram";
     int64_t ple_row_cache = 1 << 20;   ///< bounded row cache (rows of 90 B); 0 disables
     int ple_inflight = 64;
     double ple_delay_us = 0;           ///< fault injection: every row read completes no earlier than this
@@ -244,10 +249,14 @@ void usage() {
                  "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
                  "  --ple-gguf PATH      required PLE table (original second GGUF shard)\n"
                  "  --no-ple             explicit diagnostic ablation of the PLE layer\n"
-                 "  --ple-io direct|mmap|ram  n-gram table reads. direct (default): unbuffered SSD reads, the\n"
-                 "                       table never enters RAM or the file cache; mmap: A/B arm; ram (Stage 1.2A):\n"
-                 "                       preload the whole 26.8 GiB table into system RAM at startup and read it\n"
-                 "                       from RAM (no --ple-ram alias); preload threads: --ple-ram-threads N\n"
+                 "  --ple-io ram|direct|mmap  PLE storage mode. Explicit --ple-io always overrides the default.\n"
+                 "                       ram    (default) Load the PLE table into system RAM. ~26.8 GiB for the\n"
+                 "                                currently benchmarked model; no PLE NVMe reads at inference time.\n"
+                 "                       direct Read PLE data using direct I/O from storage; the table never\n"
+                 "                                enters RAM or the file cache.\n"
+                 "                       mmap   Memory-map the PLE table (alternative/testing mode).\n"
+                 "                       Use 'direct' on systems where RAM is insufficient for the resident PLE\n"
+                 "                       table. Preload threads for ram: --ple-ram-threads N\n"
                  "  --ple-row-cache N    bounded cache of fetched rows, 90 B each (default 1048576; 0 = off)\n"
                  "  --ple-inflight N     outstanding SSD reads (default 64)\n"
                  "  --ple-delay-us U     fault injection: each row read completes no earlier than U us\n"
@@ -887,6 +896,13 @@ int main(int argc, char** argv) {
         pio.cache_rows = (uint64_t) o.ple_row_cache;
         pio.io_thread = !o.ple_sync_submit;
         pio.ram_threads = (uint32_t) o.ple_ram_threads;
+        // Stage 1.2B: input to the insufficient-RAM guard in PleTable::open (runs before the preload). Beyond
+        // the resident PLE table the engine needs the expert arena (~40 GiB for the current Swift-1.5 model,
+        // measured 39.97) plus headroom for KV/activations/overhead - Stage 1.2A measured 67.5 GiB total peak
+        // RSS with the table resident (26.82 table + 39.97 arena + 0.7). 42 GiB = arena + 2 GiB headroom. On a
+        // 64 GB machine the ram default then fails clearly BEFORE preloading and points at --ple-io direct,
+        // the documented lower-RAM fallback. No mode is ever switched silently.
+        pio.ram_rest_bytes = 42ULL << 30;
         if (!ple_table.open(o.ple_gguf, err, pio)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
@@ -946,8 +962,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: the PLE run is not ready after construction\n");
             return 1;
         }
-        std::fprintf(stderr, "strata generate: PLE on, table %llu rows of %s\n",
-                     (unsigned long long) ple_table.rows(), o.ple_gguf.c_str());
+        std::fprintf(stderr, "strata generate: PLE on, table %llu rows of %s (PLE I/O mode: %s)\n",
+                     (unsigned long long) ple_table.rows(), o.ple_gguf.c_str(), o.ple_io.c_str());
     } else {
         std::fprintf(stderr,
                      "strata generate: PLE OFF by explicit --no-ple diagnostic request.\n"

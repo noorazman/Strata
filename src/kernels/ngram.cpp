@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <thread>
 #include <vector>
 #include <stdexcept>
@@ -137,6 +138,27 @@ struct PleTable::Impl {
     double preload_s = 0;
 };
 
+// Stage 1.2B: total system RAM in bytes from /proc/meminfo (MemTotal kB). 0 when unavailable (e.g. non-Linux),
+// in which case the insufficient-RAM guard is skipped and the mmap itself remains the last line of defense.
+static uint64_t system_total_ram_bytes() {
+    std::ifstream f("/proc/meminfo");
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.rfind("MemTotal:", 0) == 0) {
+            long long kb = 0;
+            if (std::sscanf(line.c_str(), "MemTotal: %lld kB", &kb) == 1 && kb > 0)
+                return (uint64_t) kb << 10;
+        }
+    }
+    return 0;
+}
+
+static std::string gib_str(uint64_t bytes) {
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%.2f GiB", (double) bytes / (double) (1ULL << 30));
+    return buf;
+}
+
 PleTable::PleTable() : impl_(new Impl) {}
 PleTable::~PleTable() { close(); delete impl_; }
 
@@ -217,12 +239,28 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         const uint64_t table_offset = impl_->file->data_start() + t->offset;
         const uint64_t n_rows = impl_->n_rows;
         const uint64_t bytes = n_rows * (uint64_t) PLE_ROW_BYTES;
+        // Stage 1.2B insufficient-RAM guard: run BEFORE the preload. If the caller told us how much RAM the
+        // rest of the engine needs (io.ram_rest_bytes), require the total to fit on this machine and fail
+        // clearly - never silently switch to another mode, which would make the performance behavior
+        // surprising on a low-RAM box.
+        if (io.ram_rest_bytes > 0) {
+            const uint64_t total = system_total_ram_bytes();
+            if (total > 0 && total < bytes + io.ram_rest_bytes) {
+                err = "PLE ram mode needs " + gib_str(bytes + io.ram_rest_bytes) +
+                      " of system RAM (PLE table " + gib_str(bytes) + " + the rest of the engine " +
+                      gib_str(io.ram_rest_bytes) + "), but this system has " + gib_str(total) +
+                      " total; use --ple-io direct on lower-RAM systems";
+                close();
+                return false;
+            }
+        }
         const int fd = ::open(gguf_path.c_str(), O_RDONLY);
         if (fd < 0) { err = "PleTable: cannot open " + gguf_path + " for the RAM preload"; close(); return false; }
         void* base = mmap(nullptr, (size_t) bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (base == MAP_FAILED) {
             ::close(fd);
-            err = "PleTable: cannot allocate " + std::to_string(bytes) + " bytes for the RAM table";
+            err = "PleTable: cannot allocate " + gib_str(bytes) +
+                  " for the RAM table (use --ple-io direct on lower-RAM systems)";
             close();
             return false;
         }
