@@ -1,7 +1,7 @@
 # STATE
 
 ## Current phase
-V100 Stage 1.2A (RAM-resident PLE) — COMPLETE. Stage 1.1 remains COMPLETE (branch `stage1.1-performance` @ c16ec22); Stage 1 remains COMPLETE (tag `stage1-v100-moe-pass` @ fa146c9, untouched).
+V100 Stage 1.2A (RAM-resident PLE) — COMPLETE (tag `stage1.2a-ple-ram-pass`). Stage 1.1 remains COMPLETE (branch `stage1.1-performance` @ c16ec22); Stage 1 remains COMPLETE (tag `stage1-v100-moe-pass` @ fa146c9, untouched).
 
 ## Current commit
 Branch `stage1.2a-ple-ram` (from `stage1.1-performance` c16ec22) — this commit updates the state files. Verify with `git log --oneline -3`.
