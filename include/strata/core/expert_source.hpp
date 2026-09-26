@@ -212,6 +212,12 @@ struct ExpertDispatch {
     std::vector<float> usage;
     int64_t multi_misses = 0;      ///< distinct (layer, expert) pairs the CPU computed in verify windows
     int64_t multi_entries = 0;     ///< routed (token, expert) entries the CPU served in verify windows
+    // Stage 1.3: the eight slowest verify-window dispatches with their phase split, to find where the host
+    // falls behind the GPU's doorbells (the l0/g0 6.8 ms case).
+    struct SlowDispatch { double total = 0, plan = 0, actq = 0, jobs = 0, run = 0, t_start_ms = 0,
+                             gu = 0, q = 0, down = 0;
+                           int64_t layer = 0, ntok = 0; int njobs = 0; };
+    std::vector<SlowDispatch> top_slow;
     /// Set when `dispatch` could not produce an answer.  The loop itself has no error channel, so this is
     /// where a source failure surfaces: the driver checks it after `session_loop` returns rather than the
     /// engine computing from a half-filled `parts`.

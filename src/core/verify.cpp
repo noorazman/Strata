@@ -703,6 +703,9 @@ bool Verifier::capture_commit(std::string& err) {
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err) {
     using namespace strata::kernels;
+    static const auto vepoch = std::chrono::steady_clock::now();
+    if (first_window_ms < 0)
+        first_window_ms = std::chrono::duration<double, std::milli>(Clock::now() - vepoch).count();
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
@@ -742,6 +745,18 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     VDBG("launched\n");
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
+    auto track = [vepoch](std::vector<SlowLayer>& v, double ms, double t0, int l, int grp) {
+        const SlowLayer e{ms, t0, l, grp};
+        if (v.size() < 8) {
+            v.push_back(e);
+            std::sort(v.begin(), v.end(), [](const auto& x, const auto& y) { return x.ms > y.ms; });
+            return;
+        }
+        for (auto& x : v)
+            if (ms > x.ms) { x = e;
+                std::sort(v.begin(), v.end(), [](const auto& x2, const auto& y2) { return x2.ms > y2.ms; });
+                break; }
+    };
     const int G = groups_[T] > 0 ? groups_[T] : 1;
     const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
     for (int64_t k = 0; k < g.n_layers * G; ++k) {
@@ -751,6 +766,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         const Clock::time_point a = Clock::now();
         auto last_flush = a;
         uint32_t spins = 0;
+        // Stage 1.3: the flush interval was A/B'd at the --pcie-frac 0.2 optimum (interleaved, same window:
+        // 64 us = 48.15/48.53/48.82 tok/s, 2 ms = 48.49/49.00/49.27).  The 2 ms interval - the original -
+        // won every adjacent pair by ~0.4 tok/s: the frequent driver entries of a 64 us flush cost more than
+        // the visibility lag they remove (the l1/g0 13-17 ms ring spins are unchanged at 64 us).  Reverted
+        // to 2 ms; see Docs/v100-stage1.3-final.md.
         while (*seq < want) {
             _mm_pause();
             if ((++spins & 1023u) != 0) continue;
@@ -789,7 +809,16 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
         *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
+        if (k == 0) {
+            const double w0 = std::chrono::duration<double, std::milli>(b - a).count();
+            ms_wait0 += w0;
+            if (w0 > max_wait0) max_wait0 = w0;
+        }
         ms_pool += ms_since(b);
+        if (k == 0) ms_pool0 += ms_since(b);
+        const double t0ms = std::chrono::duration<double, std::milli>(a - vepoch).count();
+        track(top_wait, std::chrono::duration<double, std::milli>(b - a).count(), t0ms, (int) l, grp);
+        track(top_pool, ms_since(b), t0ms, (int) l, grp);
     }
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }

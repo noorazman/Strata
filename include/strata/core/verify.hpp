@@ -79,6 +79,14 @@ public:
     void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
+    // Stage 1.3: the round head - layer 0 of each window. Its ring is the first the host sees after launching, so
+    // ms_wait0 isolates ring-visibility/spin lag and ms_pool0 isolates plan+pool lag for the round's first layer.
+    double ms_wait0 = 0, ms_pool0 = 0, max_wait0 = 0, max_pool0 = 0;
+    // Stage 1.3: the eight slowest (layer, group) spins and pools seen so far, to find where the host falls
+    // behind the GPU's doorbells.
+    struct SlowLayer { double ms = 0, t_start_ms = 0; int l = 0, grp = 0; };
+    std::vector<SlowLayer> top_wait, top_pool;
+    double first_window_ms = -1;   ///< t+ of the first verify window (decode start), for the slow-layer timestamps
     int64_t windows = 0;
 
 private:

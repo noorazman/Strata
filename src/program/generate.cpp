@@ -2675,6 +2675,21 @@ int main(int argc, char** argv) {
                         (double) (drive.d.multi_misses - misses0) / (double) (rounds * g.n_layers),
                         (double) (drive.d.multi_entries - entries0) / (double) (rounds * g.n_layers));
         if (rounds > 0)
+            std::printf("%-24s layer 0 (round head): wait %.3f (max %.3f)  pool %.3f (max %.3f) ms/round\n",
+                        "verify round head", ver.ms_wait0 / rounds, ver.max_wait0,
+                        ver.ms_pool0 / rounds, ver.max_pool0);
+        if (rounds > 0) {
+            std::printf("%-24s slowest spins (decode-relative):  ", "verify slow layers");
+            for (size_t i = 0; i < ver.top_wait.size() && i < 5; ++i)
+                std::printf("t+%.0f l%d/g%d %.1fms  ", ver.top_wait[i].t_start_ms - ver.first_window_ms,
+                             ver.top_wait[i].l, ver.top_wait[i].grp, ver.top_wait[i].ms);
+            std::printf("| slowest pools:  ");
+            for (size_t i = 0; i < ver.top_pool.size() && i < 5; ++i)
+                std::printf("t+%.0f l%d/g%d %.1fms  ", ver.top_pool[i].t_start_ms - ver.first_window_ms,
+                             ver.top_pool[i].l, ver.top_pool[i].grp, ver.top_pool[i].ms);
+            std::printf("\n");
+        }
+        if (rounds > 0)
             std::printf("%-24s gate/up %.3f  quantize %.3f  down %.3f ms/round; %.1f GB/s over the rows phases; "
                         "CPU pool call %.3f ms/round\n", "pool multi", pool.ms_multi_gu / rounds,
                         pool.ms_multi_q / rounds, pool.ms_multi_down / rounds,
@@ -2684,6 +2699,17 @@ int main(int argc, char** argv) {
             std::printf("%-24s plan %.3f  activation quantize %.3f  jobs %.3f  run %.3f ms/round\n", "dispatch",
                         drive.d.ms_plan / rounds, drive.d.ms_actq / rounds, drive.d.ms_jobs / rounds,
                         drive.d.ms_run / rounds);
+        if (rounds > 0) {
+            std::printf("%-24s slowest dispatch: ", "dispatch slow");
+            for (size_t i = 0; i < drive.d.top_slow.size() && i < 8; ++i) {
+                const auto& s = drive.d.top_slow[i];
+                std::printf("t+%.0fms l%lld t%lld j%d total %.1f (plan %.1f actq %.1f jobs %.1f run %.1f "
+                             "[gu %.1f q %.1f down %.1f])  ",
+                             s.t_start_ms, (long long) s.layer, (long long) s.ntok, s.njobs,
+                             s.total, s.plan, s.actq, s.jobs, s.run, s.gu, s.q, s.down);
+            }
+            std::printf("\n");
+        }
         if (rounds > 0 && !drive.d.usage.empty())
             std::printf("%-24s %lld experts swapped into the VRAM tier (every %d rounds, %.3f ms/round)\n", "adaptive tier",
                         (long long) swaps_total, o.adapt_every, ms_adapt / rounds);

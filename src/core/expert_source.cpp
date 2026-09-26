@@ -409,14 +409,33 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             ++d.multi_entries;
         }
     const auto c3 = std::chrono::steady_clock::now();
+    const double gu0 = d.pool->ms_multi_gu, q0 = d.pool->ms_multi_q, dn0 = d.pool->ms_multi_down;
     if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
     else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
+    const double gu1 = d.pool->ms_multi_gu, q1 = d.pool->ms_multi_q, dn1 = d.pool->ms_multi_down;
     const auto c4 = std::chrono::steady_clock::now();
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     d.ms_plan += ms(c0, c1);
     d.ms_actq += ms(c1, c2);
     d.ms_jobs += ms(c2, c3);
     d.ms_run += ms(c3, c4);
+    {
+        static const auto epoch = std::chrono::steady_clock::now();
+        const ExpertDispatch::SlowDispatch sd{ms(c0, c4), ms(c0, c1), ms(c1, c2), ms(c2, c3), ms(c3, c4),
+                                              std::chrono::duration<double, std::milli>(c0 - epoch).count(),
+                                              gu1 - gu0, q1 - q0, dn1 - dn0,
+                                              d.layers, n_tok, njobs};
+        auto& v = d.top_slow;
+        if (v.size() < 8) {
+            v.push_back(sd);
+            std::sort(v.begin(), v.end(), [](const auto& x, const auto& y) { return x.total > y.total; });
+        } else {
+            for (auto& e : v)
+                if (sd.total > e.total) { e = sd;
+                    std::sort(v.begin(), v.end(), [](const auto& x, const auto& y) { return x.total > y.total; });
+                    break; }
+        }
+    }
     for (int64_t i = 0; i < n_tok * k; ++i) {
         const int64_t e = ids[i];
         if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;
