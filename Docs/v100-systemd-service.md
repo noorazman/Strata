@@ -36,7 +36,11 @@ sudo systemctl enable strata     # wanted by multi-user.target
 
 ## API endpoint
 
-- **Base:** `http://127.0.0.1:8180/v1`
+- **Base (local):** `http://127.0.0.1:8180/v1`
+- **Base (LAN, from other PCs):** `http://192.168.0.33:8180/v1`
+  (the unit binds `0.0.0.0`, so the API is reachable on all interfaces;
+  use this machine's current LAN IP — `192.168.0.33` as of 2026-09-27)
+- **Model alias (the `model` field in requests):** `swift-iq3_xxs`
 - **OpenAI:** `POST /v1/chat/completions` (stream and non-stream)
 - **Anthropic:** `POST /v1/messages` (stream and non-stream)
 - **Models:** `GET /v1/models`
@@ -54,6 +58,13 @@ curl -s -X POST http://127.0.0.1:8180/v1/chat/completions \
 
 The model is a thinking model: short `max_tokens` may return only
 `reasoning_content`; raise `max_tokens` to get the final `content`.
+
+**Security note:** the API currently has **no API key** (`/health` shows
+`"api_key": false`), so any host that can reach `192.168.0.33:8180` can call
+it. To add one: append `--api-key <key>` to `ExecStart` (or set
+`Environment=STRATA_API_KEY=<key>`), `sudo systemctl daemon-reload`,
+`sudo systemctl restart strata`; clients then send
+`Authorization: Bearer <key>` (OpenAI) or `x-api-key: <key>` (Anthropic).
 
 ## Model / configuration
 

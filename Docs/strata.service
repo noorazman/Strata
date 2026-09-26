@@ -27,7 +27,7 @@ Environment=CUDA_VISIBLE_DEVICES=0
 # CUDA runtime libraries on the loader path (matches the config's lib_dirs).
 Environment=LD_LIBRARY_PATH=/usr/local/cuda/lib64
 
-ExecStart=/home/noorazman/dsh/strata/Strata/.venv/bin/python -m serve.server --engine strata --config /home/noorazman/dsh/strata/Strata/strata-swift-iq3_xxs.json --host 127.0.0.1 --port 8180
+ExecStart=/home/noorazman/dsh/strata/Strata/.venv/bin/python -m serve.server --engine strata --config /home/noorazman/dsh/strata/Strata/strata-swift-iq3_xxs.json --host 0.0.0.0 --port 8180
 
 # Restart automatically if the process crashes.
 Restart=on-failure
