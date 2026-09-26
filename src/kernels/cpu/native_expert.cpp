@@ -4,6 +4,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
+#include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include "ggml.h"
@@ -83,6 +84,16 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         iq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
         return;
     }
+    // Stage 1.4 (H3): on AVX2-only machines the same weight-decode redundancy exists (ggml-cpu's AVX2 dots are
+    // single-token), and the pool always sees nt >= 2.  The AVX2 decode-once rows are bit-identical to the
+    // per-token ggml-cpu path (verified by src/kernels/iq_avx2_parity.cpp on 122,880 rows x nt 1..4, all five
+    // gu formats, both GGUF shards).  2x2 interleaved 256-token A/B (H3 on 50.45 tok/s mean, off 50.64):
+    // e2e-neutral in this dispatch-bound regime, so it stays opt-in: STRATA_IQAVX2=1 enables it.
+    static const bool iqavx2 = cpu_avx2_ok() && std::getenv("STRATA_IQAVX2") != nullptr;
+    if (iqavx2 && nt >= 2 && iqavx2_supported(f.gu_type)) {
+        iqavx2_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+        return;
+    }
     const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
     const int n = (int) f.n_embd;
     for (int r = r0; r < r1; ++r) {
@@ -99,6 +110,13 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1) {
+    // Stage 1.4: same decode-once treatment for IQ down projections (the Swift pack's Q2_K/Q2_0 down rows keep
+    // the per-token ggml-cpu path - their decode is cheap, so the redundancy is not worth a dedicated kernel).
+    static const bool iqavx2 = cpu_avx2_ok() && std::getenv("STRATA_NO_IQAVX2") == nullptr;
+    if (iqavx2 && nt >= 2 && iqavx2_supported(f.d_type)) {
+        iqavx2_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
     const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;
     const int n = (int) f.n_ff;
     for (int r = r0; r < r1; ++r) {
