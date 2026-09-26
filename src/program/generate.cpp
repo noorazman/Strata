@@ -221,7 +221,8 @@ struct Options {
     int64_t mtp_window = 32768;   ///< the draft layer attends to the last N cells (0 = every cell)
     /// Plan v0.3 P6: the share (0..1) of each layer's distinct missed experts the GPU reads over PCIe from the
     /// pinned arena while the CPU computes the rest (verify windows).
-    double pcie_frac = -1.0;   ///< < 0: the model's default (0.2 direct for the Q2_0 pack, 0.55 DMA for native packs)
+    double pcie_frac = -1.0;   ///< < 0: the model's default (0.2 for the Q2_0 pack, 0.2 DMA for native packs -
+                               ///< the Stage 1.3 measured optimum on the V100, was 0.55; see v100-stage1.3-final.md)
     std::string pcie_mode = "auto";   ///< auto | dma | kernel | direct
     /// Plan v0.3 P6: every `adapt_every` rounds, swap up to `adapt_swaps` of the most-routed missing experts into
     /// the VRAM tier in place of the least-routed resident ones (decayed counts).  0 = static residency.
@@ -707,8 +708,14 @@ int main(int argc, char** argv) {
         }
     }
     const bool native_pack = strata::kernels::cpu::expert_layout().native;
-    // plan v0.3 P6: the PCIe share of the missed experts, measured per kind of pack (the paper, finding on PCIe)
-    if (o.pcie_frac < 0.0) o.pcie_frac = native_pack ? 0.55 : 0.2;
+    // plan v0.3 P6: the PCIe share of the missed experts, measured per kind of pack (the paper, finding on PCIe).
+    // Stage 1.3 (V100, Swift-1.5 Qwen3.8 IQ3_XXS, --pool-workers 24): the native-pack default is 0.55, but a
+    // measured sweep on this machine (decode 256 tokens, 32 GB) found 0.2 the sweet spot: 0.55 -> 43.5 tok/s,
+    // 0.35 -> 46.3, 0.25 -> 43.9, 0.2 -> 49.5, 0.0 -> 47.3.  The GPU was stalling 1.47 s of its 2.27 s of
+    // wait_flag_ge time on the PCIe staging DMA (flag B); 0.2 moves most of the missed experts to the CPU pool
+    // (which sits at ~7-9% of the box) and cuts the staging wait to ~0.13 s, for a ~14% decode gain with no
+    // VRAM change.  0.0 (no PCIe) is slightly worse and 0.35 keeps too much staging.  See Docs/v100-stage1.3-final.md.
+    if (o.pcie_frac < 0.0) o.pcie_frac = 0.2;
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
     if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
     else if (!strata::kernels::cpu::cpu_avx512_ok())
