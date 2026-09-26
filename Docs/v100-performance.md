@@ -223,3 +223,49 @@ adjacent pair by ~0.4 tok/s — not a visibility effect); commit-graph overlap (
 `Verifier::commit` sync; the host saving is cancelled by +0.30 ms/round MTP-draft
 slowdown). Correctness: 32/32 golden on both cards, 256/256 deterministic, ctest 20/22
 (2 pre-existing environmental), no CUDA errors, no VRAM regression.
+
+# V100 Performance — Stage 1.4 Results (CPU row production / flag C)
+
+Full write-up: `Docs/v100-stage1.4-final.md`. Config: 1.3 defaults (`--ple-io ram`,
+`--pcie-frac 0.2`) + `--pool-workers 24`, 256-token decode. Baseline = 1.4 frozen
+(48.88/48.62 tok/s GPU0; 47.56/47.20 GPU4; flag C 360.5 ms of GPU `wait_flag_ge`,
+n=5328, mean 67.7 µs).
+
+**Flag C root cause:** the GPU waits per dispatch (48/round × 111 rounds = 5,328 waits)
+for the CPU down-projection rows, which in the baseline pipeline were serialized behind
+two worker barriers plus a host-serial intermediate-quantization loop. The pool's 25
+threads were already 82–83 % busy (20.5 thread-equiv) while the box-wide mean was ~7 % —
+the pool is compute/synchronization-bound, not capacity-bound ("more CPU workers"
+rejected by measurement, H1a).
+
+**The fix (H2, default):** one fused barrier phase per dispatch (pool mode 7) — gu row
+chunks accumulate a per-expert release counter; per-expert quantization runs as pool
+tasks overlapping the other experts' work; down chunks wait per-expert. Same row work,
+same kernels, same numerics; one barrier and one host-serial step removed per dispatch.
+`STRATA_POOL_UNFUSE=1` restores the baseline path.
+
+| metric, 256 tok | 1.4 baseline | final (fused default) |
+|---|---:|---:|
+| decode, GPU0 32 GB | 48.88 / 48.62 tok/s | **50.99 / 51.01 tok/s (+4.5–5.1 %)** |
+| decode, GPU4 16 GB | 47.56 / 47.20 tok/s | **47.83 / 48.25 tok/s (+0.6–2.4 %)** |
+| per-token latency, GPU0 | 20.46–20.57 ms | 19.61 ms (−4.3 %) |
+| pool wall (256 tok, A/B) | 1,358.3 ms mean | 1,205.4 ms mean (−11.2 %) |
+| pool threads | 82 % busy, 9,130 phases | 92–93 % busy, 4,565 phases |
+| flag C (nsys) | 360.5 ms | **193.6–292.3 ms (−19 to −46 %)** |
+| total `wait_flag_ge` (nsys) | 1,635.6 ms | ~1,667 ms (flat) |
+| peak VRAM | 18,896 / 16,133 MiB | unchanged |
+
+**H3 (decode-once AVX2 expert dots):** ggml-cpu's AVX2 dots re-decode weight codebooks per
+token; the new kernels decode once per (row, block) and are **bit-identical** to the
+per-token AVX2 path (parity harness: 122,880 rows × nt 1..4, all five gu formats, both
+GGUF shards). Interleaved 2×2 A/B is e2e-neutral (50.45 vs 50.64 tok/s) — the pack's down
+projections are Q2_K/Q2_0, so only 1/3 of the dot FLOPs (gu rows) are affected while the
+pool is compute-bound. Shipped opt-in: `STRATA_IQAVX2=1` (off by default).
+
+**Rejected (measured, reverted to default):** H1a `--no-host-worker` (49.21 tok/s, pool
+wall +2.4 %); H3 as default (e2e-neutral, see above). Correctness: 32/32 golden on both
+cards, 256/256 deterministic per card (H2 and H3 both 0-token-difference vs the 1.4
+baseline sequence on GPU0), ctest 20/22 (same 2 pre-existing environmental failures),
+no CUDA errors, no VRAM regression. Remaining bottleneck (1.5 candidates, not touched):
+flag A 1,100.9 ms (early-layer `l1/g0` tail — frozen here), residual flag C 193.6 ms
+(per-dispatch host path ≈ 1.9 ms/round × 48), flag B 372.9 ms, pcie-frac 0.25–0.35 sweep.
