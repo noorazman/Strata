@@ -186,3 +186,40 @@ switching modes silently. All four modes re-validated: 32/32 golden,
 token-identical; default-mode numbers match the 1.2A RAM results (prefill
 406.2 tok/s chunk / TTFT 6.15 s, decode 42.2–44.0 tok/s, peak RSS 67.55 GiB,
 zero PLE NVMe at inference). Full write-up: `Docs/v100-stage1.2b-final.md`.
+
+## Stage 1.3 — Expert pool synchronization optimization (branch `stage1.3-expert-pool-sync`)
+
+Full write-up: `Docs/v100-stage1.3-final.md`. Scope: the complete
+`wait_flag_ge_kernel` lifecycle on the IQ3_XXS native pack; one optimization at a time;
+no PLE/pool-workers/KV/speculation/Flash-Attention/dense changes.
+
+**The bottleneck (measured, nsys 2024.6.2, 256-token decode):** at the 0.55 baseline,
+1338.9 ms of the 2273.6 ms total GPU `wait_flag_ge` time was **flag B waiting on the PCIe
+staging DMA** (its next global event is the staging copy on the copy engine — the
+smoking gun). The CPU pool ran at 7–9 % of the box while the GPU sat idle on ~1.9 expert
+blobs/layer of staging.
+
+**The fix: `--pcie-frac 0.2`** (was 0.55) — move most missed experts to the CPU pool,
+stage far fewer. Now the program default for native packs.
+
+| metric, GPU0 32 GB, workers 24 | baseline 0.55 | final 0.2 |
+|---|---:|---:|
+| decode 256 tokens | 43.48 / 43.60 tok/s | **48.62 / 48.87 tok/s (+11.5–12.3 %)** |
+| total GPU wait (nsys) | 2273.6 ms | **1604.4 ms (−29 %)** |
+| flag B (staging DMA) | 1338.9 ms | 385.6 ms |
+| flag C (CPU rows) | 34.2 ms | 376.6 ms (new critical path) |
+| H2D staging | 45.1 GB | 31.6 GB (−30 %) |
+| peak VRAM | 18,896 MiB | 18,896 MiB (unchanged) |
+
+Measured pcie-frac curve (same window): 0.55→43.48, 0.35→46.31, 0.25→43.93 (fails golden),
+0.2→48.6–49.8, 0.0→47.33. `--pcie-mode direct` (no staging)→35.81 (rejected).
+
+**16 GB (GPU4) survives the final config:** 47.56 / 47.20 tok/s, peak VRAM 16,133 MiB
+(unchanged), 32/32 golden **now identical to the 32 GB golden** (was divergent at token 6
+under 0.55), 256/256 deterministic.
+
+**Rejected (measured, reverted):** spin-flush 64 µs (interleaved A/B at 0.2: 2 ms won every
+adjacent pair by ~0.4 tok/s — not a visibility effect); commit-graph overlap (drop the
+`Verifier::commit` sync; the host saving is cancelled by +0.30 ms/round MTP-draft
+slowdown). Correctness: 32/32 golden on both cards, 256/256 deterministic, ctest 20/22
+(2 pre-existing environmental), no CUDA errors, no VRAM regression.
