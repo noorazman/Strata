@@ -420,6 +420,16 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     d.ms_jobs += ms(c2, c3);
     d.ms_run += ms(c3, c4);
     {
+        const double tot_us = ms(c0, c4) * 1000.0, run_us = ms(c3, c4) * 1000.0;
+        const auto bucket = [](double us) { return us < 20 ? 0 : us < 50 ? 1 : us < 100 ? 2 : us < 200 ? 3 :
+                                                us < 500 ? 4 : us < 1000 ? 5 : 6; };
+        d.hist_disp[bucket(tot_us)] += 1;
+        d.hist_run[bucket(run_us)] += 1;
+        const int l = (int) d.layers;
+        if (l >= 0 && l < 128) { d.layer_disp[(size_t) l] += ms(c0, c4); d.layer_run[(size_t) l] += ms(c3, c4);
+                                 d.layer_n[(size_t) l] += 1; }
+    }
+    {
         static const auto epoch = std::chrono::steady_clock::now();
         const ExpertDispatch::SlowDispatch sd{ms(c0, c4), ms(c0, c1), ms(c1, c2), ms(c2, c3), ms(c3, c4),
                                               std::chrono::duration<double, std::milli>(c0 - epoch).count(),

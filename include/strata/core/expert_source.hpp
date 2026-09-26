@@ -218,6 +218,12 @@ struct ExpertDispatch {
                              gu = 0, q = 0, down = 0;
                            int64_t layer = 0, ntok = 0; int njobs = 0; };
     std::vector<SlowDispatch> top_slow;
+    // Stage 1.4 (flag C): the per-dispatch time DISTRIBUTION, not just the mean or the tail.  Buckets (us):
+    // <20, 20-50, 50-100, 100-200, 200-500, 500-1000, >=1000.  hist_disp = the whole dispatch (ring -> flag C),
+    // hist_run = the pool run phase alone.  Per-layer sums expose whether specific layers route more CPU work.
+    double hist_disp[7] = {0}, hist_run[7] = {0};
+    double layer_disp[128] = {0}, layer_run[128] = {0};
+    int64_t layer_n[128] = {0};
     /// Set when `dispatch` could not produce an answer.  The loop itself has no error channel, so this is
     /// where a source failure surfaces: the driver checks it after `session_loop` returns rather than the
     /// engine computing from a half-filled `parts`.

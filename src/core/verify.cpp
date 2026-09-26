@@ -850,6 +850,7 @@ void Verifier::set_plan_slot(int grp) {
 // Flag B only rises: a host function of an earlier layer may run after a later layer already raised it directly.
 void Verifier::raise_flag(uint32_t* flag, uint32_t value) {
     volatile long* f = (volatile long*) flag;
+    (void) f;   // used on the _WIN32 path below; the CAS path on POSIX touches `flag` directly
 #if defined(_WIN32)
     long cur = *f;
     while ((uint32_t) cur < value) {
