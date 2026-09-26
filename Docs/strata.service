@@ -1,0 +1,45 @@
+# Strata V100 inference API server (Swift IQ3_XXS on the 32 GB V100, GPU0)
+#
+# Install:  sudo cp Docs/strata.service /etc/systemd/system/strata.service
+#            sudo systemctl daemon-reload
+#            sudo systemctl enable --now strata
+# Manage:   sudo systemctl start|stop|restart|status strata
+#            journalctl -u strata -f
+#
+# Runs as the normal user (noorazman), not root.
+
+[Unit]
+Description=Strata V100 inference API server (Swift IQ3_XXS, 32 GB V100 GPU0, port 8180)
+After=network.target
+
+[Service]
+Type=simple
+User=noorazman
+Group=noorazman
+WorkingDirectory=/home/noorazman/dsh/strata/Strata
+
+# The ~40 GiB expert arena pins host memory with mlock; systemd's default
+# LimitMEMLOCK is 8 MB, so it must be lifted to unlimited for the arena to pin.
+LimitMEMLOCK=infinity
+
+# Explicit GPU selection: the 32 GB V100 is GPU0. Do not rely on device ordering.
+Environment=CUDA_VISIBLE_DEVICES=0
+# CUDA runtime libraries on the loader path (matches the config's lib_dirs).
+Environment=LD_LIBRARY_PATH=/usr/local/cuda/lib64
+
+ExecStart=/home/noorazman/dsh/strata/Strata/.venv/bin/python -m serve.server --engine strata --config /home/noorazman/dsh/strata/Strata/strata-swift-iq3_xxs.json --host 127.0.0.1 --port 8180
+
+# Restart automatically if the process crashes.
+Restart=on-failure
+RestartSec=5
+
+# Logs go to the journal (journalctl -u strata).
+StandardOutput=journal
+StandardError=journal
+
+# Clean stop: SIGINT triggers the server's graceful shutdown (QUIT to the engine).
+KillSignal=SIGINT
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
