@@ -117,6 +117,19 @@ public:
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
     int64_t multi_bytes = 0;
+    /// Stage 1.4: the run_phase (multi-token) totals for the driver to report: the park wait, the wall time
+    /// publish-to-done and the busy time computed inside the task bodies (wall and busy are host-thread reads).
+    void phase_multi_ms(double& park_wait, double& wall, double& busy) const {
+        park_wait = ms_phase_wait_;
+        wall = ms_phase_wall_;
+        busy = ms_phase_busy_;
+    }
+    double phase_repark_ms() const { return ms_phase_repark_; }
+    /// Stage 1.4: average per-phase publish-to-first-worker-done and publish-to-last-done (the critical path),
+    /// in ns; `proto_n()` is the number of phases accumulated.  Host-thread reads of host-side accumulators.
+    long long proto_first() const { return proto_first_; }
+    long long proto_tail() const { return proto_tail_; }
+    long long proto_n() const { return proto_n_; }
 
     /// Total `_mm_pause` iterations spent waiting, over all workers, is no longer counted - see the note on the
     /// atomics below.  It was a LOCKED read-modify-write in the park loop, so measuring the contention added to
@@ -152,6 +165,15 @@ private:
     double ms_wait_park_ = 0.0;
     double ms_drain_ = 0.0;
     double ms_repark_ = 0.0;
+    // Stage 1.4: `run_phase` (the multi-token path every native-pack verify dispatch uses), accumulated the
+    // same way: wall = publish to done+parked, busy = what the threads (host included) actually computed
+    // inside their task bodies.  busy/wall answers "are the workers idle while rows are pending" - a low
+    // ratio means the barrier/wake-up overhead or an unbalanced tail, a ratio near 1 means the time is the
+    // work itself.
+    double ms_phase_wait_ = 0.0, ms_phase_wall_ = 0.0, ms_phase_busy_ = 0.0;
+    alignas(64) std::atomic<long long> busy_ns_{0};
+    double ms_phase_repark_ = 0.0;
+    long long proto_first_ = 0, proto_tail_ = 0, proto_n_ = 0;
     // ---- EACH ATOMIC GETS ITS OWN CACHE LINE, AND THE SPIN COUNTER IS GONE.  (Review finding C3.)
     //
     // These were six adjacent atomics, which put `head_`, `done_`, `parked_` and `epoch_` on ONE cache line -
@@ -183,6 +205,23 @@ private:
     ExpertJobMulti* mjobs_ = nullptr;
     int64_t mrows_ = 0;     // rows of the current multi phase across all its experts (n * FF, then n * H)
     int mtasks_ = 1;        // equal row ranges the phase is cut into
+    // Stage 1.4 fused phase (mode 7): the down rows of the SAME call ride in one barrier phase behind the gate/
+    // up rows, gated per expert so a down row never reads an intermediate the gate/up pass has not finished.
+    // `mrows_dn_` / `fuse_nb_` are set with `mrows_` (the gate/up rows) before the single run_phase.
+    int64_t mrows_dn_ = 0;
+    int fuse_nb_ = 0;
+    /// Per-expert gate for the fused phase, one CACHE LINE each (the down tasks spin on it): the gate/up tasks
+    /// release-add their finished row counts; the expert's quantization task spins until the count is FF,
+    /// quantizes, then stores FF+1; the down tasks spin until > FF.  Values are per-phase, reset before each
+    /// publish (the reset happens-before the epoch bump that wakes the workers).
+    struct alignas(64) FuseGate {
+        std::atomic<uint32_t> v{0};
+        FuseGate() = default;
+        // movable so the vector can reallocate (std::atomic itself is not copyable/movable); the values are
+        // per-phase and are reset before every publish, so a move of a stale value is harmless.
+        FuseGate(FuseGate&& o) noexcept : v(o.v.load(std::memory_order_relaxed)) {}
+    };
+    std::vector<FuseGate> fgate_;
     struct SplitBufMulti {
         alignas(64) float ff[MAXT][FF];
         ActQ a2[MAXT];

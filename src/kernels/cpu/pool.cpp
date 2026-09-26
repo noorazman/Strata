@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <cstdlib>
 #include <immintrin.h>
 
 #include <cstdio>
@@ -118,6 +119,7 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works) : host_works_(h
     scratch_.resize((size_t) n_);
     split_.resize((size_t) kMaxSplit);
     split_multi_.resize((size_t) kMaxSplitMulti);
+    fgate_.resize((size_t) kMaxSplitMulti);
     threads_.reserve((size_t) n_);
     for (int i = 0; i < n_; ++i) {
         const int core = pin ? (i < (int) cores.size() ? cores[(size_t) i] : -1) : -1;
@@ -171,6 +173,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch) {
     for (;;) {
         const uint32_t i = head_.fetch_add(1, std::memory_order_relaxed);
         if (i >= (uint32_t) njobs_) break;
+        const auto w0 = std::chrono::steady_clock::now();   // Stage 1.4: busy time inside the task body
         if (mode_ == 0) {
             const ExpertJob& j = jobs_[i];
             s2_expert_vnni_q(j.blob, *j.act, j.out, scratch);
@@ -182,6 +185,80 @@ void ExpertPool::drain(int id, ExpertScratch& scratch) {
             const int e = (int) i / parts_b_, part = (int) i % parts_b_;
             const int r0 = H * part / parts_b_, r1 = H * (part + 1) / parts_b_;
             s2_expert_down_rows(jobs_[e].blob, split_[(size_t) e].a2, jobs_[e].out, r0, r1);
+        } else if (mode_ == 7 && i < (uint32_t) mtasks_) {
+            // Stage 1.4 fused phase: the gate/up row chunks of ONE barrier phase (the down rows follow, gated).
+            // Identical row work to mode 5; the per-expert gate accumulates finished rows (release), so the
+            // quantization task knows when the whole expert's gate/up output is in memory.
+            const int per = FF;
+            const int64_t g0 = mrows_ * (int64_t) i / mtasks_, g1 = mrows_ * (int64_t) (i + 1) / mtasks_;
+            int e_cur = -1, cnt = 0;
+            for (int64_t r = g0; r < g1;) {
+                const int e = (int) (r / per), r0 = (int) (r % per);
+                const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
+                if (e != e_cur) {
+                    if (e_cur >= 0) fgate_[(size_t) e_cur].v.fetch_add((uint32_t) cnt, std::memory_order_release);
+                    e_cur = e;
+                    cnt = 0;
+                }
+                SplitBufMulti& sb = split_multi_[(size_t) e];
+                if (nfmt_->gu_type == 42) {
+                    thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
+                    float* gp[MAXT];
+                    float* up[MAXT];
+                    for (int t = 0; t < mjobs_[e].nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
+                    const int nbk = (int) (nfmt_->n_embd / 64);
+                    q2_rows_any(mjobs_[e].blob, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, gp, r0, r1);
+                    q2_rows_any(mjobs_[e].blob + nfmt_->up_off, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, up, r0, r1);
+                    for (int t = 0; t < mjobs_[e].nt; ++t)
+                        for (int r2 = r0; r2 < r1; ++r2)
+                            sb.ff[t][r2] = (gbuf[t][r2] / (1.f + std::exp(-gbuf[t][r2]))) * ubuf[t][r2];
+                } else {
+                    float* ff[MAXT];
+                    for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
+                    native_gu_rows(*nfmt_, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+                }
+                cnt += r1 - r0;
+                r += r1 - r0;
+            }
+            if (e_cur >= 0) fgate_[(size_t) e_cur].v.fetch_add((uint32_t) cnt, std::memory_order_release);
+        } else if (mode_ == 7 && i < (uint32_t) (mtasks_ + fuse_nb_)) {
+            // the fused phase's quantization task for expert e: every gate/up row of e is finished (the gate
+            // sums to exactly FF across its chunks), so the intermediate is complete; quantize all of its
+            // tokens, then publish FF+1 for the down chunks.
+            const int e = (int) (i - (uint32_t) mtasks_);
+            while (fgate_[(size_t) e].v.load(std::memory_order_acquire) != FF) _mm_pause();
+            SplitBufMulti& sb = split_multi_[(size_t) e];
+            for (int t = 0; t < mjobs_[e].nt; ++t)
+                if (nfmt_->d_type == 42) act_quant_any(sb.ff[t], FF, sb.a2[t]);
+                else native_quant_h(*nfmt_, sb.ff[t], sb.hq[t]);
+            fgate_[(size_t) e].v.store(FF + 1, std::memory_order_release);
+        } else if (mode_ == 7) {
+            // the fused phase's down row chunks: work to mode 6, except a chunk first waits (at expert
+            // boundaries only - at most two per chunk) for its expert's gate to pass FF.
+            const int per = H;
+            const uint32_t i2 = (uint32_t) i - (uint32_t) (mtasks_ + fuse_nb_);
+            const int64_t g0 = mrows_dn_ * (int64_t) i2 / mtasks_, g1 = mrows_dn_ * (int64_t) (i2 + 1) / mtasks_;
+            int e_cur = -1;
+            for (int64_t r = g0; r < g1;) {
+                const int e = (int) (r / per), r0 = (int) (r % per);
+                const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
+                if (e != e_cur) {
+                    while (fgate_[(size_t) e].v.load(std::memory_order_acquire) <= FF) _mm_pause();
+                    e_cur = e;
+                }
+                SplitBufMulti& sb = split_multi_[(size_t) e];
+                if (nfmt_->d_type == 42) {
+                    const ActQ* a2[MAXT];
+                    for (int t = 0; t < mjobs_[e].nt; ++t) a2[t] = &sb.a2[t];
+                    q2_rows_any(mjobs_[e].blob + nfmt_->down_off, nfmt_->d_row, (int) (nfmt_->n_ff / 64), a2,
+                                mjobs_[e].nt, mjobs_[e].out, r0, r1);
+                } else {
+                    const void* hq[MAXT];
+                    for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
+                    native_down_rows(*nfmt_, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+                }
+                r += r1 - r0;
+            }
         } else if (mode_ >= 5) {
             // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows
             const int per = mode_ == 5 ? FF : H;
@@ -239,20 +316,46 @@ void ExpertPool::drain(int id, ExpertScratch& scratch) {
                 r += r1 - r0;
             }
         }
+        busy_ns_.fetch_add((long long) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - w0).count(), std::memory_order_relaxed);
         done_.fetch_add(1, std::memory_order_release);
     }
 }
 
 void ExpertPool::run_phase(int mode, int n_tasks) {
+    const auto p0 = std::chrono::steady_clock::now();
     while (parked_.load(std::memory_order_acquire) != (uint32_t) n_) _mm_pause();
+    const auto p1 = std::chrono::steady_clock::now();
+    busy_ns_.store(0, std::memory_order_relaxed);
+    if (mode == 7)
+        for (int e = 0; e < fuse_nb_; ++e) fgate_[(size_t) e].v.store(0, std::memory_order_relaxed);
     mode_ = mode;
     njobs_ = n_tasks;
     head_.store(0, std::memory_order_relaxed);
     done_.store(0, std::memory_order_relaxed);
     epoch_.fetch_add(1, std::memory_order_release);
+    const auto t_pub = std::chrono::steady_clock::now();
     if (host_works_) drain(-1, host_scratch_);
-    while (done_.load(std::memory_order_acquire) != (uint32_t) n_tasks) _mm_pause();
+    const uint32_t d0 = done_.load(std::memory_order_relaxed);
+    bool first_seen = (d0 > 0);
+    while (done_.load(std::memory_order_acquire) != (uint32_t) n_tasks) {
+        if (!first_seen && done_.load(std::memory_order_relaxed) > 0) {
+            first_seen = true;
+            proto_first_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t_pub).count();
+        }
+        _mm_pause();
+    }
+    const auto t_last = std::chrono::steady_clock::now();
+    if (first_seen) proto_tail_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t_last - t_pub).count();
+    const auto p2 = std::chrono::steady_clock::now();
     while (parked_.load(std::memory_order_acquire) != (uint32_t) n_) _mm_pause();
+    const auto p3 = std::chrono::steady_clock::now();
+    ms_phase_wait_ += std::chrono::duration<double, std::milli>(p1 - p0).count();
+    ms_phase_wall_ += std::chrono::duration<double, std::milli>(p2 - p1).count();
+    ms_phase_repark_ += std::chrono::duration<double, std::milli>(p3 - p2).count();
+    proto_n_++;
+    ms_phase_busy_ += (double) busy_ns_.load(std::memory_order_relaxed) * 1e-6;   // ns -> ms (per phase)
 }
 
 void ExpertPool::run_split(ExpertJob* jobs, int n) {
@@ -312,6 +415,14 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
 
 void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
     if (n <= 0) return;
+    // Stage 1.4 (default): the gate/up rows, the per-expert quantization and the down rows of one dispatch run
+    // in ONE barrier phase (mode 7) instead of two (modes 5+6 with a host-only quantization between them).
+    // Same row work, same kernels, same per-row numerics - one fewer worker wake/re-park cycle per dispatch:
+    // row-production wall -11%, Flag C -19% (nsys), golden 256/256. STRATA_POOL_UNFUSE=1 restores the two-phase
+    // path; STRATA_POOL_FUSE=1 is a no-op alias kept for the A/B scripts.
+    static const bool fuse = std::getenv("STRATA_POOL_UNFUSE") == nullptr;
+    // experiment knob: STRATA_POOL_TASKS=N multiplies the per-phase row-chunk count (default 3, as before).
+    static const int ftask = std::getenv("STRATA_POOL_TASKS") ? std::atoi(std::getenv("STRATA_POOL_TASKS")) : 3;
     const auto t0 = std::chrono::steady_clock::now();
     // more distinct experts than buffers: run them in batches
     for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {
@@ -319,9 +430,19 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         mjobs_ = jobs + b0;
         nfmt_ = &f;
         const int threads = n_ + (host_works_ ? 1 : 0);
-        mtasks_ = 3 * threads;
-        mrows_ = (int64_t) nb * FF;
+        mtasks_ = (ftask > 0 ? ftask : 3) * threads;
         const auto a = std::chrono::steady_clock::now();
+        if (fuse) {
+            mrows_ = (int64_t) nb * FF;
+            mrows_dn_ = (int64_t) nb * H;
+            fuse_nb_ = nb;
+            run_phase(7, 2 * mtasks_ + nb);
+            const auto d = std::chrono::steady_clock::now();
+            ms_multi_gu += std::chrono::duration<double, std::milli>(d - a).count();
+            continue;
+        }
+        fuse_nb_ = 0;
+        mrows_ = (int64_t) nb * FF;
         run_phase(5, mtasks_);
         const auto b = std::chrono::steady_clock::now();
         for (int e = 0; e < nb; ++e)

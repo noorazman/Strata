@@ -2710,6 +2710,41 @@ int main(int argc, char** argv) {
             }
             std::printf("\n");
         }
+        if (rounds > 0) {
+            static const char* bnames[] = {"<20us", "20-50us", "50-100us", "100-200us", "200-500us", "0.5-1ms", ">=1ms"};
+            std::printf("%-24s dispatch: ", "dispatch dist");
+            for (int b = 0; b < 7; ++b)
+                std::printf("%s n=%d  ", bnames[b], (int) drive.d.hist_disp[b]);
+            std::printf("| run: ");
+            for (int b = 0; b < 7; ++b)
+                std::printf("%s n=%d  ", bnames[b], (int) drive.d.hist_run[b]);
+            std::printf("\n");
+            for (int half = 0; half < 2; ++half) {
+                std::printf("%-24s l%d: ", half == 0 ? "dispatch per-layer" : " ", half * g.n_layers / 2);
+                for (int l = half * g.n_layers / 2; l < (half + 1) * g.n_layers / 2; ++l)
+                    if (l < 128 && drive.d.layer_n[l] > 0)
+                        std::printf("l%d %d/%.1f/%.1f  ", l, (int) drive.d.layer_n[l],
+                                     drive.d.layer_disp[l] / (double) drive.d.layer_n[l],
+                                     drive.d.layer_run[l] / (double) drive.d.layer_n[l]);
+                std::printf("\n");
+            }
+        }
+        if (rounds > 0) {
+            double pm_wait = 0, pm_wall = 0, pm_busy = 0, pm_repark = 0;
+            pool.phase_multi_ms(pm_wait, pm_wall, pm_busy);
+            pm_repark = pool.phase_repark_ms();
+            if (pm_wall > 0.0) {
+                // busy is total THREAD-ms over all phases; wall is the host's publish-to-done.  Available
+                // thread-time is wall x (workers + the host when it drains), so utilization is busy / that.
+                const double pth = (double) pool.workers() + (pool.host_works() ? 1.0 : 0.0);
+                const double util = pm_busy / (pm_wall * pth);
+                std::printf("%-24s wall %.1f ms  busy %.1f ms (%.0f%% of %d threads, %.1f thread-equiv)  park-wait %.1f ms  repark %.1f ms  pub->first %.1f us  pub->last %.1f us  phases %lld\n",
+                            "pool threads", pm_wall, pm_busy, 100.0 * util, (int) pth, pm_busy / pm_wall,
+                            pm_wait,
+                            pm_repark, pool.proto_first() / 1e3 / std::max(1LL, pool.proto_n()),
+                            pool.proto_tail() / 1e3 / std::max(1LL, pool.proto_n()), pool.proto_n());
+            }
+        }
         if (rounds > 0 && !drive.d.usage.empty())
             std::printf("%-24s %lld experts swapped into the VRAM tier (every %d rounds, %.3f ms/round)\n", "adaptive tier",
                         (long long) swaps_total, o.adapt_every, ms_adapt / rounds);
