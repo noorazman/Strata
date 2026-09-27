@@ -269,3 +269,44 @@ baseline sequence on GPU0), ctest 20/22 (same 2 pre-existing environmental failu
 no CUDA errors, no VRAM regression. Remaining bottleneck (1.5 candidates, not touched):
 flag A 1,100.9 ms (early-layer `l1/g0` tail — frozen here), residual flag C 193.6 ms
 (per-dispatch host path ≈ 1.9 ms/round × 48), flag B 372.9 ms, pcie-frac 0.25–0.35 sweep.
+
+## Stage 1.5 — ExpertPool idle parking (24-core idle burn → ~0)
+
+The 24 pinned expert-pool workers spin-parked on `_mm_pause()` between batches and burned
+24.0 logical cores at 100 % while the engine sat idle between requests. Default fix: park
+after `STRATA_POOL_PARK` (2048 µs) of spin. Decode-neutral (48.9–49.3 tok/s); idle CPU
+24.0 → ~0 cores. The park-gap histogram showed 90 % of the 109,562 parks are 256 µs–1 ms
+and 3.1 % ≥ 4 ms — no small-gap regime a tiny spin window would protect. Doc:
+`Docs/v100-stage1.5-final.md`.
+
+## Stage 1.6 — CPU pool scheduling optimization (48.7 → 50.0–50.1 tok/s, +~3 %)
+
+The remaining CPU-side bottleneck was profiled as the **round-head wait-C (layer-0 flag-C)
+visibility lag, 9–14 ms uniform** (~25 % of the ~51 ms round). Measured hop by hop: workers
+raise flag-C ≤ 0.11–0.20 ms after dispatch; the WC flag store+`sfence` is ≤ 12 µs; and the
+`STRATA_WAIT_ITERS=1` probe shows the GPU polls normally (25,564 iters = ~364–500 ns/iter) —
+the flag value is genuinely invisible to the GPU for the full spin even though the CPU-side
+store+fence completes in µs. Isolation microbenchmarks show ~immediate CPU→GPU visibility in
+every configuration (host/worker core, WC/WB, posted/non-posted, cross-core reset+write,
++24 DRAM-traffic threads), so the lag is context-specific to the window boundary (PCIe /
+memory-controller / IOMMU interaction under the round's staging DMA + MTP, on a socket-0 row
+with a steady ~1/s corrected-MCE stream on MC_CHA bank 5; MCE rate 1.0/s idle = 1.0/s under
+load → not the primary cause).
+
+| config (GPU0, 256 tok) | decode tok/s |
+|---|---:|
+| baseline (1.5: WB flags, sync rows, non-pinned arena) | 48.58 / 48.82 |
+| async rows dispatch (vs sync 49.44 / 49.99) | 48.99 / 50.85 (neutral) |
+| arena pinned to host NUMA node (keeper) | 50.07 |
+| **final (WC flags + non-posted publish + async + arena)** | **50.0–50.1 (avg of 6 interleaved runs)** |
+| fresh flag-C page (`STRATA_ALTFLAGC`, opt-in) | 50.11 vs 50.00 (partial address win) |
+
+**Keepers:** arena pinned to the host thread's NUMA node by default (`STRATA_ARENA_NODE`
+override; +1.8 % e2e, drain −11 %); async rows dispatch (`STRATA_POOL_ASYNC`, default ON);
+WC host→GPU flags + non-posted publish (store + `lock addl $0` + `sfence`); `STRATA_POOL_CORES`
+knob. **Rejected (measured):** SMT workers on node1 (−11 %), SMT-node0 workers (42 tok/s),
+governor `performance`/min_freq (deployment rec only), park threshold change (kept 2048 µs),
+full WC (ymiss/plan back to WB). Correctness: 32/32 golden every run; 256/256 deterministic ×2;
+16 GB (GPU4) 48.87 tok/s, first-32 golden, 96/256 cross-card diffs (≈108 pre-existing);
+ctest 20/22. **Remaining bottleneck:** the ~13 ms round-head flag-C visibility lag (documented,
+not fully fixable in software). Doc: `Docs/v100-stage1.6-final.md`.
