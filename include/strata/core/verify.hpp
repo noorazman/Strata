@@ -35,8 +35,11 @@ namespace strata::core {
 class NativeHead;
 
 /// The CPU pool for a window: x_f (n_tok, n_embd), ids (n_tok, k) -> out (n_tok * k, n_embd), hit rows zeroed.
-using PoolMultiFn = void (*)(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
-                             int64_t layer);
+/// `flagC`/`want` are the layer's flag-C word and ring value.  The callback returns true when the pool's
+/// participants raise that flag themselves (the Stage 1.6 async rows phase - the rows are still in flight) and
+/// the caller must not; false keeps the legacy post-pool `*flagC = want` store (rows complete on return).
+using PoolMultiFn = bool (*)(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
+                             int64_t layer, volatile uint32_t* flagC, uint32_t want);
 
 struct VerifyHits {
     const int32_t* d_res = nullptr;      ///< device [n_layers * n_expert] slot or -1
@@ -88,6 +91,14 @@ public:
     std::vector<SlowLayer> top_wait, top_pool;
     double first_window_ms = -1;   ///< t+ of the first verify window (decode start), for the slow-layer timestamps
     int64_t windows = 0;
+    // Stage 1.6 probe (STRATA_WAIT_ITERS=1): the wait kernels' poll-iteration counts, max'd per slot across
+    // windows.  slot = (l * G + grp) * 3 + {0 = flag A, 1 = flag B, 2 = flag C}.  A 9 ms spin with ~9e6
+    // iterations is a 1 ns poll (the flag was slow to land in DRAM); one with ~1e4 is a ~1 us poll (the wait
+    // kernel itself is coarse).
+    uint64_t* d_wait_iters_ = nullptr;
+    uint64_t* h_wait_iters_ = nullptr;
+    uint64_t* wait_iters_max_ = nullptr;
+    int64_t wait_iters_slots_ = 0;
 
 private:
     bool capture(int T, std::string& err);
@@ -122,6 +133,7 @@ private:
     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;
     uint32_t* h_flagA_ = nullptr; uint32_t* m_flagA_ = nullptr;  // the GPU plan is in place
     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
+    uint32_t* h_flagC2_ = nullptr; uint32_t* m_flagC2_ = nullptr; bool alt_flagC_ = false; // Stage 1.6: A/B for a fresh flag-C page
     cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
     struct FlagSet { uint32_t* flag; uint32_t value; };
     FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)

@@ -118,6 +118,19 @@ public:
     /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
     static constexpr int kMaxSplitMulti = 96;
+    /// Stage 1.6: fire the fused multi-native rows phase (mode 7) WITHOUT blocking.  The workers (and the host,
+    /// when it drains) process the rows, and the last participant to finish raises `*flagC` to `want` - the
+    /// layer's flag-C word the GPU's waitC spins on - in place of the host's post-pool store.  Returns false
+    /// (nothing published; the caller keeps the synchronous path) when a phase is still in flight, the batch
+    /// exceeds one kMaxSplitMulti slice, or the STRATA_POOL_UNFUSE two-phase path is forced.  `jobs` must stay
+    /// valid until the flag is raised (it does: the caller's per-window buffer, consumed by the rows before the
+    /// next window reuses it).
+    bool dispatch_multi_native_async(const NativeFmt& f, ExpertJobMulti* jobs, int n,
+                                     volatile uint32_t* flagC, uint32_t want);
+    /// Stage 1.6: the worker-measured wall of the async rows phases (publish to flagC), in ms - add it to
+    /// `ms_multi_gu` when reporting the rows phases' total.
+    double ms_async_wall() const { return (double) async_wall_ns_.load(std::memory_order_relaxed) * 1e-6; }
+    long long async_phases() const { return async_phases_; }
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
     int64_t multi_bytes = 0;
@@ -157,6 +170,8 @@ private:
     void worker(int id);
     void drain(int id, ExpertScratch& scratch);
     void run_phase(int mode, int n_tasks);
+    /// Stage 1.6: one participant leaves its share of the in-flight async phase; the last one raises flagC.
+    void async_participant_done();
 
     int n_ = 0;
     bool host_works_ = true;
@@ -195,6 +210,20 @@ private:
     alignas(64) std::atomic<uint32_t> parked_{0};
     alignas(64) std::atomic<uint32_t> epoch_{0};
     alignas(64) std::atomic<bool> stop_{false};
+    // Stage 1.6 async rows: at most one fused phase is in flight.  Every participant (each worker, and the host
+    // when `host_works_`) calls async_participant_done() when it leaves its share - a worker when it re-parks
+    // (its claimed rows are all written), the host when its drain returns.  The last one to complete the phase
+    // has every row visible (each store happens-before its participant's release fetch_add; the RMW total order
+    // chains them), so it raises the layer's flagC.  `async_armed_` doubles as the in-flight marker the next
+    // dispatch tests before resetting the shared phase state.
+    alignas(64) std::atomic<bool> async_armed_{false};
+    alignas(64) std::atomic<uint32_t> async_finished_{0};
+    alignas(64) std::atomic<long long> async_t0_ns_{0};
+    alignas(64) std::atomic<long long> async_wall_ns_{0};
+    volatile uint32_t* async_flagC_ = nullptr;
+    uint32_t async_want_ = 0;
+    uint32_t async_participants_ = 0;
+    long long async_phases_ = 0;
     // Stage 1.5: park-gap histogram (diagnostics, STRATA_POOL_PARK_DIAG=1).  Each worker records how long it
     // spent waiting in the park before a publish moved the epoch: this is the inter-dispatch gap distribution
     // the STRATA_POOL_PARK threshold sweep is tuned against.  9 buckets over pool.cpp's kGapEdges (us).

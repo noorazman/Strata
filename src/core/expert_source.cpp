@@ -13,10 +13,17 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <thread>
 #include <vector>
+#ifndef _WIN32
+#include <numaif.h>
+#include <sched.h>
+#include <sys/syscall.h>
+#include <iterator>
+#endif
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -410,8 +417,18 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
     const auto c3 = std::chrono::steady_clock::now();
     const double gu0 = d.pool->ms_multi_gu, q0 = d.pool->ms_multi_q, dn0 = d.pool->ms_multi_down;
-    if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
-    else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
+    d.rows_async = false;
+    if (native) {
+        // Stage 1.6: fire the fused rows phase without blocking - the plan is already published (flagA), the
+        // host returns to the layer loop, and the workers raise flagC when the rows land.  The host no longer
+        // holds the next layer's plan (flagA) behind this layer's rows: that hold-up is what the GPU's flag-A
+        // spin measured (993.97 ms of the 1101 ms flag-A total at the round head, nsys, Stage 1.6).
+        if (d.async_rows_enabled && d.pool != nullptr && d.async_flagC != nullptr)
+            d.rows_async = d.pool->dispatch_multi_native_async(lay.fmt[(size_t) d.layers], d.jobs_multi.data(),
+                                                               njobs, d.async_flagC, d.async_want);
+        if (!d.rows_async) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
+    } else
+        d.pool->run_split_multi(d.jobs_multi.data(), njobs);
     const double gu1 = d.pool->ms_multi_gu, q1 = d.pool->ms_multi_q, dn1 = d.pool->ms_multi_down;
     const auto c4 = std::chrono::steady_clock::now();
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
@@ -567,6 +584,67 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
 // Plan v0.3 P6: the arena from the model's shard 1.  Each layer's gate, up and down tensors hold the 512 experts
 // one after another; they are read in chunks and each expert's slice lands at its place in the blob
 // [gate rows | up rows | down rows] - the layout tools/iq_pack.py would have written to experts.bin.
+#ifndef _WIN32
+// Stage 1.6 placement A/B -> keeper: the arena's pages land where the loader threads first-touch them
+// (MPOL_DEFAULT), which on this box had drifted non-deterministically onto node 1 (the 6 loader threads,
+// scheduler-placed, first-touch the 40 GB arena). Measured (interleaved, GPU0, 24 workers, 256 tok): arena on
+// node 0 (where the host, the 26.8 GB PLE and 13 of the 24 workers sit) = pool/drain 11.88 -> 12.97-13.42 ms/tok
+// and 48.70 -> 49.08-50.07 tok/s. So the DEFAULT is now the calling thread's NUMA node (deterministic: the host
+// loads the arena, the host is on its own node); STRATA_ARENA_NODE=<n> still overrides it for A/B work. The node
+// is a property of the DATA, not the workers.
+static bool cpulist_contains(const std::string& s, int cpu) {
+    size_t i0 = 0;
+    for (;;) {
+        const size_t i1 = s.find(',', i0);
+        const std::string e = s.substr(i0, i1 == std::string::npos ? std::string::npos : i1 - i0);
+        const size_t d = e.find('-');
+        const int a = d == std::string::npos ? std::atoi(e.c_str()) : std::atoi(e.substr(0, d).c_str());
+        const int b = d == std::string::npos ? a : std::atoi(e.substr(d + 1).c_str());
+        if (cpu >= a && cpu <= b) return true;
+        if (i1 == std::string::npos) return false;
+        i0 = i1 + 1;
+    }
+}
+// The NUMA node of the calling thread's first affinity CPU (the host, at arena-load time). -1 if unknown.
+static int main_thread_node() {
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof set, &set) != 0) return -1;
+    int cpu = -1;
+    for (int i = 0; i < CPU_SETSIZE; ++i)
+        if (CPU_ISSET(i, &set)) { cpu = i; break; }
+    if (cpu < 0) return -1;
+    for (int node = 0; node < 16; ++node) {
+        char path[64];
+        std::snprintf(path, sizeof path, "/sys/devices/system/node/node%d/cpulist", node);
+        std::ifstream f(path);
+        if (!f) continue;
+        const std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        if (cpulist_contains(s, cpu)) return node;
+    }
+    return -1;
+}
+static int arena_preferred_node() {
+    const char* e = std::getenv("STRATA_ARENA_NODE");
+    if (e && *e) {
+        const int n = std::atoi(e);
+        return (n >= 0 && n <= 15) ? n : -1;
+    }
+    return main_thread_node();   // the Stage 1.6 default: the host's node, not the loader threads' whim
+}
+static void apply_arena_node() {
+    const int n = arena_preferred_node();
+    if (n >= 0) {
+        // Raw syscall (SYS_set_mempolicy = 237 on x86_64) like the Stage 1.5 futex: this glibc declares
+        // set_mempolicy in <numaif.h> but does not export the symbol from libc. Kernel ABI: nmask is an
+        // unsigned long nodemask, maxnode is the max node index + 1.
+        const unsigned long mask = 1ul << (unsigned) n;
+        ::syscall(SYS_set_mempolicy, MPOL_PREFERRED, &mask, 16u);
+    }
+}
+#else
+static void apply_arena_node() {}
+#endif
+
 LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata::kernels::cpu::ExpertLayout& lay,
                             int threads) {
     LoadStats st;
@@ -582,6 +660,7 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
         return dir + lay.gguf_file[(size_t) l];
     };
     auto worker = [&]() {
+        apply_arena_node();
         std::ifstream f;
         std::string open_name;
         std::vector<uint8_t> buf;
@@ -681,6 +760,15 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         err = "ArenaExpertSource: the arena could not be reserved (" + std::to_string(want) + " B)";
         return false;
     }
+#ifndef _WIN32
+    {
+        const int node = arena_preferred_node();
+        if (node >= 0)
+            std::fprintf(stderr, "strata experts: arena first-touch pinned to node %d (%s)\n", node,
+                         (std::getenv("STRATA_ARENA_NODE") && *std::getenv("STRATA_ARENA_NODE"))
+                             ? "STRATA_ARENA_NODE" : "default: the host thread's node (Stage 1.6)");
+    }
+#endif
     const LoadStats st = from_gguf ? load_experts_gguf(gguf_, a->data(), lay, threads)
                                    : load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20);
     if (st.bytes != want) {

@@ -62,6 +62,67 @@ bool mapped(size_t bytes, void** h, void** d) {
     return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
 }
 
+// Stage 1.6: the host-to-GPU handoff words (the A/B/C flags) live in WRITE-COMBINED pinned memory.  The
+// default cudaHostAllocMapped pages are write-BACK cacheable: a host flag store then sits dirty in the LLC,
+// and the GPU's PCIe read of the word (the wait kernels poll it every ~2 us) sees the new value only when
+// the line is eventually written back - nsys measured that gap at the round head at 6-17 ms (the "flagA"
+// spin was mostly this).  Write-combined stores bypass the cache; an sfence after the store flushes the WC
+// buffer, so the GPU's read sees the value within ~1 us.
+bool mapped_wc(size_t bytes, void** h, void** d) {
+    if (cudaHostAlloc(h, bytes, cudaHostAllocMapped | cudaHostAllocWriteCombined) != cudaSuccess) return false;
+    std::memset(*h, 0, bytes);
+    return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
+}
+
+// Stage 1.6 probe: per-site max/avg duration of the post-flag-store sfences.  If the round-head GPU spin is
+// gated on the WC drain completing in DRAM, the sfence on the publishing core should show the same ~ms stalls.
+namespace {
+    struct SfenDiag {
+        // 0 publish plan drain, 1 publish flag A, 2 raise flag B, 3 k-loop flag C (sync),
+        // 4 k-loop empty-plan flag A, 5 k-loop empty-plan counts
+        static const int kSites = 6;
+        mutable std::atomic<long long> max_ns[kSites] = {};
+        mutable std::atomic<long long> total_ns[kSites] = {};
+        mutable std::atomic<long> count[kSites] = {};
+        bool on = false;
+        SfenDiag() { on = std::getenv("STRATA_SFENCE_DIAG") != nullptr; }
+        void note(int site, long long ns) const {
+            if (!on) return;
+            count[site].fetch_add(1, std::memory_order_relaxed);
+            total_ns[site].fetch_add(ns, std::memory_order_relaxed);
+            long long m = max_ns[site].load(std::memory_order_relaxed);
+            while (ns > m && !max_ns[site].compare_exchange_weak(m, ns, std::memory_order_relaxed)) {}
+        }
+        void report() const {
+            if (!on) return;
+            for (int i = 0; i < kSites; ++i) {
+                const long c = count[i].load(std::memory_order_relaxed);
+                if (c == 0) continue;
+                const long long mn = max_ns[i].load(std::memory_order_relaxed);
+                const long long to = total_ns[i].load(std::memory_order_relaxed);
+                std::printf("sfence site %d: n=%ld max=%.3f ms avg=%.4f ms p1(total)=%.2f ms\n", i, c,
+                            mn / 1e6, (double) to / (double) c / 1e6, to / 1e6);
+            }
+        }
+    };
+    const SfenDiag& sfen_diag() { static SfenDiag d; return d; }
+    long long sfen_t0() { return (long long) std::chrono::steady_clock::now().time_since_epoch().count(); }
+
+    // Stage 1.6: publish a host flag to the GPU as a NON-POSTED write.  A plain store (even to write-combined
+    // memory, followed by sfence) is a POSTED write: the fence retires once the write is ISSUED to the memory
+    // controller, while the GPU's PCIe read of the line keeps returning the stale DRAM value until the posted
+    // write is absorbed.  On this machine that gap measured at 6-17 ms at the round head (the wait kernels'
+    // poll iteration counts prove the GPU was polling normally the whole time).  A lock-prefixed RMW on the
+    // line is non-posted: it retires only when the line's write-back has completed, so the value is in DRAM by
+    // the time the store sequence ends.  (flag B already raised by a SEQ_CST cmpxchg - i.e. a locked RMW -
+    // never showed this stall; only the plain-store flags A/C did.)
+    inline void flag_publish(volatile uint32_t* p, uint32_t v) {
+        *p = v;
+        __asm__ volatile ("lock addl $0, %0" : "+m" (*p) : : "memory");
+        _mm_sfence();
+    }
+}
+
 strata::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
     s.n_head = g.n_head;
@@ -97,8 +158,33 @@ Verifier::~Verifier() {
     if (cs_) cudaStreamDestroy(cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (arena_) cudaFree(arena_);
+    sfen_diag().report();
+    if (d_wait_iters_ != nullptr) {
+        // Report the slowest wait slots by iteration count.  The per-iteration rate is what separates a slow
+        // flag (flag took ~ms to reach DRAM -> huge count at ~1 ns/iter) from a slow poll (~1 us/iter -> tiny
+        // count).  We know the slot's (l, grp) but not the wall time of each round, so we report counts and let
+        // the operator correlate with the slow-layer line.
+        std::vector<std::pair<uint64_t, int64_t>> v;
+        for (int64_t s = 0; s < wait_iters_slots_; ++s)
+            if (wait_iters_max_[s] > 0) v.emplace_back(wait_iters_max_[s], s);
+        std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.first > b.first; });
+        if (!v.empty()) {
+            const int nshow = v.size() < 12 ? (int) v.size() : 12;
+            std::printf("wait-iter slots (max poll iterations across windows; slot = (l*G+grp)*3 + {0=A,1=B,2=C}):\n");
+            for (int i = 0; i < nshow; ++i) {
+                const uint64_t it = v[i].first;
+                const int64_t s = v[i].second;
+                const int64_t l = s / 3, w = s % 3;
+                std::printf("  l%lld w%lld (slot %lld): %llu iters\n", (long long) l, (long long) w, (long long) s,
+                            (unsigned long long) it);
+            }
+        }
+    }
+    if (d_wait_iters_) cudaFree(d_wait_iters_);
+    if (h_wait_iters_) cudaFreeHost(h_wait_iters_);
+    if (wait_iters_max_) std::free(wait_iters_max_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_};
+                     h_flagA_, h_plan_, h_flagB_, h_flagC2_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
@@ -158,11 +244,19 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(T * K * 4, (void**) &h_ids_, (void**) &m_ids_) &&
               mapped(T * K * 4, (void**) &h_w_, (void**) &m_w_) &&
               mapped(64, (void**) &h_seq_, (void**) &m_seq_) &&
-              mapped(64, (void**) &h_flag_, (void**) &m_flag_) &&
-              mapped(64, (void**) &h_flagA_, (void**) &m_flagA_) &&
-              mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
-              mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
+              mapped_wc(64, (void**) &h_flag_, (void**) &m_flag_) &&    // Stage 1.6: host->GPU flag words, WC
+              mapped_wc(64, (void**) &h_flagA_, (void**) &m_flagA_) &&   // (see mapped_wc: the round-head
+              mapped_wc(64, (void**) &h_flagB_, (void**) &m_flagB_) &&   //  6-17 ms LLC write-back gap).
+              mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);    // rows stay WB: bulk worker streams
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
+    // Stage 1.6 A/B: STRATA_ALTFLAGC=1 routes the round's flag-C through a FRESHLY allocated page (a different
+    // physical address than h_flag_) to test whether the ~13 ms round-head wait-C lag is address-specific
+    // (the engine's flag page sitting on a bad DRAM row in the MCE storm) or context-specific.
+    alt_flagC_ = getenv("STRATA_ALTFLAGC") != nullptr;
+    if (alt_flagC_ && !mapped_wc(64, (void**) &h_flagC2_, (void**) &m_flagC2_)) {
+        err = "verify: mapped alt flag-C allocation failed";
+        return false;
+    }
     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
     {
         const int64_t cap = (int64_t) (T * K);
@@ -514,7 +608,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     auto post = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
         const uint32_t ring = (uint32_t) (l * G + grp + 1);
-        wait_flag_ge(m_flagA_, ring, cs);                      // the pool published this group's GPU plan
+        uint64_t* itA = d_wait_iters_ != nullptr ? d_wait_iters_ + ((l * G + grp) * 3 + 0) : nullptr;
+        uint64_t* itB = d_wait_iters_ != nullptr ? d_wait_iters_ + ((l * G + grp) * 3 + 1) : nullptr;
+        uint64_t* itC = d_wait_iters_ != nullptr ? d_wait_iters_ + ((l * G + grp) * 3 + 2) : nullptr;
+        wait_flag_ge(m_flagA_, ring, cs, itA);                 // the pool published this group's GPU plan
         const int64_t cap = (int64_t) n * K, capx = (int64_t) max_t_ * K;
         int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
         copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
@@ -542,7 +639,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         };
         grouped(p_ptr, p_start, p_counts);
-        wait_flag_ge(m_flagB_, ring, cs);                      // the PCIe share is in staging (DMA) or mapped
+        wait_flag_ge(m_flagB_, ring, cs, itB);                 // the PCIe share is in staging (DMA) or mapped
         if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
             const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
             uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
@@ -550,7 +647,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
         }
         grouped(p_ptr2, p_start2, p_counts + 2);
-        wait_flag_ge(m_flag_, ring, cs);                       // the CPU's share is in the mapped rows
+        wait_flag_ge(alt_flagC_ ? m_flagC2_ : m_flag_, ring, cs, itC);   // the CPU's share is in the mapped rows
         copy_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
         moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
         for (int t = tb; t < te; ++t) {
@@ -710,6 +807,21 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[0].max_cells) { err = "verify: the window runs past the context"; return false; }
+    // Stage 1.6 probe: one poll-iteration slot per (layer, group) wait (flag A/B/C).  Allocated here, OUTSIDE
+    // stream capture (record_window runs inside it, and a cudaHostAlloc there poisons the capture).
+    if (std::getenv("STRATA_WAIT_ITERS") != nullptr && d_wait_iters_ == nullptr) {
+        // Size for the largest possible G (=2, split window) so any later capture's slot indexing fits.
+        wait_iters_slots_ = 3 * (int64_t) g.n_layers * 2;
+        if (cudaMalloc((void**) &d_wait_iters_, (size_t) wait_iters_slots_ * 8) == cudaSuccess &&
+            cudaHostAlloc((void**) &h_wait_iters_, (size_t) wait_iters_slots_ * 8, 0) == cudaSuccess) {
+            wait_iters_max_ = (uint64_t*) std::calloc((size_t) wait_iters_slots_, 8);
+            if (wait_iters_max_ == nullptr) {
+                cudaFree(d_wait_iters_);
+                cudaFreeHost(h_wait_iters_);
+                d_wait_iters_ = nullptr;
+            }
+        }
+    }
     if (!capture(T, err) || !capture_commit(err)) return false;
     VDBG("captured; staging\n");
     const Clock::time_point t0 = Clock::now();
@@ -731,6 +843,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
     *(volatile uint32_t*) h_seq_ = 0;
     *(volatile uint32_t*) h_flag_ = 0;
+    if (alt_flagC_) *(volatile uint32_t*) h_flagC2_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -744,7 +857,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     (void) cudaStreamQuery(cs_);
     VDBG("launched\n");
     volatile uint32_t* const seq = h_seq_;
-    volatile uint32_t* const flag = h_flag_;
+    volatile uint32_t* const flag = alt_flagC_ ? h_flagC2_ : h_flag_;
     auto track = [vepoch](std::vector<SlowLayer>& v, double ms, double t0, int l, int grp) {
         const SlowLayer e{ms, t0, l, grp};
         if (v.size() < 8) {
@@ -791,9 +904,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         cur_layer_ = want - 1;
         set_plan_slot(grp);
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
-        if (pool != nullptr)
-            pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
-                 h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+        const bool rows_async =
+            pool != nullptr ? pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
+                                   h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l, flag, want)
+                            : false;
         VDBG("layer %lld served\n", (long long) l);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
@@ -804,10 +918,24 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             sink_.start[0] = 0;
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
-            *(volatile uint32_t*) h_flagA_ = want;
+            {
+                const long long t0 = sfen_t0();
+                _mm_sfence();                               // Stage 1.6: flush the plan counts
+                sfen_diag().note(5, sfen_t0() - t0);
+            }
+            const long long tA = sfen_t0();
+            flag_publish((volatile uint32_t*) h_flagA_, want);   // non-posted: in DRAM on return
+            sfen_diag().note(4, sfen_t0() - tA);
             raise_flag(h_flagB_, want);
         }
-        *flag = want;
+        if (!rows_async) {
+            const long long t0 = sfen_t0();
+            flag_publish(flag, want);   // the rows are in: the synchronous path (or no pool) stores flag C,
+                                        // non-posted, so the GPU's waitC sees it without a posted-write lag
+            sfen_diag().note(3, sfen_t0() - t0);
+        }
+        // (rows_async: the pool's last participant stores it when the rows land - raising it now, before the
+        // rows are visible, would let the GPU's waitC pass early and read half-written rows)
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         if (k == 0) {
             const double w0 = std::chrono::duration<double, std::milli>(b - a).count();
@@ -823,6 +951,13 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
+    if (d_wait_iters_ != nullptr) {
+        const cudaError_t ce = cudaMemcpy(h_wait_iters_, d_wait_iters_, (size_t) wait_iters_slots_ * 8,
+                                          cudaMemcpyDeviceToHost);
+        if (ce == cudaSuccess)
+            for (int64_t s = 0; s < wait_iters_slots_; ++s)
+                if (h_wait_iters_[s] > wait_iters_max_[s]) wait_iters_max_[s] = h_wait_iters_[s];
+    }
     for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
     VDBG("window done\n");
     ++windows;
@@ -862,6 +997,10 @@ void Verifier::raise_flag(uint32_t* flag, uint32_t value) {
     uint32_t cur = __atomic_load_n((uint32_t*) flag, __ATOMIC_SEQ_CST);
     while (cur < value && !__atomic_compare_exchange_n((uint32_t*) flag, &cur, value, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}
 #endif
+    const long long t0 = sfen_t0();
+    _mm_sfence();   // Stage 1.6: the flag words are write-combined; flush the WC buffer so the GPU's PCIe
+                    // read sees the raise within ~1 us instead of waiting on an LLC write-back.
+    sfen_diag().note(2, sfen_t0() - t0);
 }
 
 // Plan v0.3 P6: the PCIe share by DMA.  The copy engine moves the blobs while the CPU computes its own share and the
@@ -881,8 +1020,14 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
 
 void Verifier::publish_plan(void* ctx) {
     Verifier* v = (Verifier*) ctx;
-    _mm_sfence();
-    *(volatile uint32_t*) v->h_flagA_ = v->cur_layer_ + 1;
+    {
+        const long long t0 = sfen_t0();
+        _mm_sfence();   // the plan words are flushed before the flag
+        sfen_diag().note(0, sfen_t0() - t0);
+    }
+    const long long t1 = sfen_t0();
+    flag_publish((volatile uint32_t*) v->h_flagA_, v->cur_layer_ + 1);   // non-posted: in DRAM on return
+    sfen_diag().note(1, sfen_t0() - t1);
 }
 
 bool Verifier::commit(int n_keep, std::string& err) {

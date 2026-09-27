@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <immintrin.h>
 
 #include <cstdio>
@@ -128,6 +129,30 @@ inline void park_on_epoch(std::atomic<uint32_t>& epoch, const std::atomic<bool>&
 
 const char* ExpertPool::park_mode() const { return park_cfg().desc; }
 
+// Stage 1.6 placement experiment: STRATA_POOL_CORES overrides the worker pin list.
+// Format: comma-separated logical CPUs, ranges allowed ("1-13,29-41" = the 24 SMT pair of node 0's
+// cores 1-13). Empty/unset -> the default physical-core list. The count must cover n_workers; a
+// clear startup error (not a silent re-pin) on mismatch so an experiment config cannot quietly
+// fall back to a different placement than the one being measured.
+std::vector<int> pool_cores_override() {
+    std::vector<int> out;
+    const char* e = std::getenv("STRATA_POOL_CORES");
+    if (!e || !*e) return out;
+    char* endp = nullptr;
+    for (const char* p = e;; p = endp) {
+        while (*p == ',' || *p == ' ') p++;
+        if (!*p) break;
+        char* q = nullptr;
+        const long a = std::strtol(p, &q, 10);
+        if (q == p) break;
+        long b = a;
+        if (*q == '-') { b = std::strtol(q + 1, &endp, 10); } else { endp = q; }
+        for (long c = a; c <= b; ++c) out.push_back((int) c);
+        if (a < 0 || b > 1023 || a > b) break;
+    }
+    return out;
+}
+
 std::vector<int> physical_cores(bool skip_first) {
     std::vector<int> cores;
 #if defined(_WIN32)
@@ -221,7 +246,21 @@ void restore_thread_affinity(long long previous) {
 }
 
 ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works) : host_works_(host_works) {
-    const std::vector<int> cores = physical_cores(true);
+    std::vector<int> cores = physical_cores(true);
+    if (pin) {
+        const std::vector<int> ov = pool_cores_override();   // STRATA_POOL_CORES (Stage 1.6 placement A/B)
+        if (!ov.empty()) {
+            if ((int) ov.size() < (n_workers > 0 ? n_workers : 1)) {
+                std::fprintf(stderr, "strata pool: STRATA_POOL_CORES has %zu cores but %d workers are pinned; "
+                                     "extend the list or drop --pool-workers\n", ov.size(), n_workers);
+                std::abort();
+            }
+            cores = ov;
+            std::fprintf(stderr, "strata pool: worker placement override active (STRATA_POOL_CORES, %zu cores; "
+                                 "first %d, last %d)\n", ov.size(), ov.front(),
+                         ov[std::min((size_t) (n_workers > 0 ? n_workers : 1), ov.size()) - 1]);
+        }
+    }
     n_ = n_workers > 0 ? n_workers : (int) cores.size();
     if (n_ < 1) n_ = 1;
     scratch_.resize((size_t) n_);
@@ -238,7 +277,77 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works) : host_works_(h
     }
 }
 
+// Stage 1.6 diagnostic (STRATA_POOL_ASYNC_DIAG=1): the top-10 slowest async phases, worker-clock wall
+// (publish_epoch to the last participant's flag-C store).  A mutex once per phase (once per layer) is noise.
+namespace {
+struct AsyncDiag {
+    std::mutex mu;
+    std::vector<std::pair<long long, long long>> top;   // (wall_ns, phase)
+    long long phase = 0;
+    bool on = false;
+    AsyncDiag() { const char* e = std::getenv("STRATA_POOL_ASYNC_DIAG"); on = e && *e; }
+    void note(long long wall_ns) {
+        if (!on) return;
+        std::lock_guard<std::mutex> g(mu);
+        ++phase;
+        top.emplace_back(wall_ns, phase);
+        if (top.size() > 10) {
+            auto it = std::max_element(top.begin(), top.end(),
+                                       [](auto& a, auto& b) { return a.first < b.first; });
+            top.erase(it, top.end());
+        }
+    }
+    void report() {
+        if (!on || top.empty()) return;
+        std::vector<std::pair<long long, long long>> v = top;
+        std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.first > b.first; });
+        std::fprintf(stderr, "pool async slow phases (worker wall, publish->flagC):\n");
+        for (auto& p : v)
+            std::fprintf(stderr, "  phase %lld: %.2f ms\n", p.second, p.first / 1e6);
+    }
+};
+// Stage 1.6 probe: per-site max/avg duration of the pool's post-store sfences (WC drains).
+// site 0: worker drain-tail flush, 1: the flag-C sfence in async_participant_done, 2: the host dispatch-end flush.
+struct SfenDiag {
+    static const int kSites = 3;
+    mutable std::atomic<long long> max_ns[kSites] = {};
+    mutable std::atomic<long long> total_ns[kSites] = {};
+    mutable std::atomic<long> count[kSites] = {};
+    bool on = false;
+    SfenDiag() { on = std::getenv("STRATA_SFENCE_DIAG") != nullptr; }
+    void note(int site, long long ns) const {
+        if (!on) return;
+        count[site].fetch_add(1, std::memory_order_relaxed);
+        total_ns[site].fetch_add(ns, std::memory_order_relaxed);
+        long long m = max_ns[site].load(std::memory_order_relaxed);
+        while (ns > m && !max_ns[site].compare_exchange_weak(m, ns, std::memory_order_relaxed)) {}
+    }
+    void report() const {
+        if (!on) return;
+        for (int i = 0; i < kSites; ++i) {
+            const long c = count[i].load(std::memory_order_relaxed);
+            if (c == 0) continue;
+            const long long mn = max_ns[i].load(std::memory_order_relaxed);
+            const long long to = total_ns[i].load(std::memory_order_relaxed);
+            std::fprintf(stderr, "pool sfence site %d: n=%ld max=%.3f ms avg=%.4f ms total=%.2f ms\n", i, c,
+                         mn / 1e6, (double) to / (double) c / 1e6, to / 1e6);
+        }
+    }
+};
+const SfenDiag& sfen_diag_pool() {
+    static SfenDiag d;
+    return d;
+}
+long long sfen_t0() { return (long long) std::chrono::steady_clock::now().time_since_epoch().count(); }
+AsyncDiag& async_diag() {
+    static AsyncDiag d;
+    return d;
+}
+}   // namespace
+
 ExpertPool::~ExpertPool() {
+    async_diag().report();
+    sfen_diag_pool().report();
     stop_.store(true, std::memory_order_release);
     // Bump the epoch (and wake any futex-parked worker) so a PARKED worker notices the stop flag rather
     // than sleeping through it.
@@ -322,7 +431,44 @@ void ExpertPool::worker(int id) {
         // Drain: one claim per iteration, so a slow worker takes fewer experts and a fast one takes more.
         // Every job is the same size (all experts are 1,382,400 bytes), so there is nothing to schedule.
         drain(id, scratch_[(size_t) id]);
+        {
+            const long long t0 = sfen_t0();
+            _mm_sfence();   // Stage 1.6: the verify rows target the write-combined h_ymiss_.  Flush THIS core's
+                            // WC buffer before re-parking: the phase's last participant raises flag C from its own
+                            // core (its sfence flushes only its own WC lines), so every participant's rows must
+                            // already be in DRAM when the flag lands.
+            sfen_diag_pool().note(0, sfen_t0() - t0);
+        }
         parked_.fetch_add(1, std::memory_order_acq_rel);   // back at the park
+        // Stage 1.6 async rows: the drain returns only after every claimed row is written, so a worker leaving
+        // here has its rows visible; the phase's last participant raises the layer's flagC instead of the host.
+        async_participant_done();
+    }
+}
+
+void ExpertPool::async_participant_done() {
+    if (!async_armed_.load(std::memory_order_acquire)) return;
+    const uint32_t done = async_finished_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (done == async_participants_) {
+        const long long t0 = async_t0_ns_.load(std::memory_order_relaxed);
+        const long long now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch()).count();
+        const long long wall = t0 > 0 ? now - t0 : 0;
+        if (t0 > 0)
+            async_wall_ns_.fetch_add(wall, std::memory_order_relaxed);
+        {
+            // Stage 1.6: publish flag C as a NON-POSTED write.  A plain store (even to write-combined memory
+            // followed by sfence) is a posted write - it is ISSUED but the GPU's PCIe read of the line keeps
+            // returning the stale DRAM value until it is absorbed (measured 6-17 ms at the round head).  A
+            // lock-prefixed RMW retires only once the line's write-back has completed, so the value is in DRAM
+            // by the time this returns.
+            const long long t0 = sfen_t0();
+            *async_flagC_ = async_want_;
+            __asm__ volatile ("lock addl $0, %0" : "+m" (*async_flagC_) : : "memory");   // non-posted: DRAM on return
+            sfen_diag_pool().note(1, sfen_t0() - t0);
+        }
+        async_armed_.store(false, std::memory_order_release);
+        async_diag().note(wall);
     }
 }
 
@@ -618,6 +764,58 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
     multi_bytes += (int64_t) n * (int64_t) f.bytes;
     mode_ = 0;
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+bool ExpertPool::dispatch_multi_native_async(const NativeFmt& f, ExpertJobMulti* jobs, int n,
+                                             volatile uint32_t* flagC, uint32_t want) {
+    if (n <= 0 || n > kMaxSplitMulti) return false;
+    // The unfused two-phase path has a host-serial quantization between its phases - it stays synchronous.
+    if (std::getenv("STRATA_POOL_UNFUSE") != nullptr) return false;
+    if (async_armed_.load(std::memory_order_acquire)) return false;   // a phase is still in flight
+    // The workers must be parked (the previous phase fully drained, rows visible) before the shared phase
+    // state is reset.  A worker that re-parked has finished its claimed rows, so `parked_ == n_` here is the
+    // completion guarantee this dispatch relies on.
+    while (parked_.load(std::memory_order_acquire) != (uint32_t) n_) _mm_pause();
+    static const int ftask = std::getenv("STRATA_POOL_TASKS") ? std::atoi(std::getenv("STRATA_POOL_TASKS")) : 3;
+    mjobs_ = jobs;
+    nfmt_ = &f;
+    const int threads = n_ + (host_works_ ? 1 : 0);
+    mtasks_ = (ftask > 0 ? ftask : 3) * threads;
+    mrows_ = (int64_t) n * FF;
+    mrows_dn_ = (int64_t) n * H;
+    fuse_nb_ = n;
+    mode_ = 7;
+    for (int e = 0; e < fuse_nb_; ++e) fgate_[(size_t) e].v.store(0, std::memory_order_relaxed);
+    njobs_ = 2 * mtasks_ + n;
+    head_.store(0, std::memory_order_relaxed);
+    done_.store(0, std::memory_order_relaxed);
+    async_flagC_ = flagC;
+    async_want_ = want;
+    async_participants_ = (uint32_t) threads;
+    async_finished_.store(0, std::memory_order_relaxed);
+    async_t0_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch()).count(),
+                       std::memory_order_relaxed);
+    async_armed_.store(true, std::memory_order_release);
+    publish_epoch(epoch_);
+    if (host_works_) {
+        drain(-1, host_scratch_);   // the host's share, alongside the workers (same path as run_phase)
+        async_participant_done();
+    }
+    {
+        const long long t0 = sfen_t0();
+        _mm_sfence();   // Stage 1.6: the host zeroed this layer's hit rows into the write-combined h_ymiss_ (and
+                        // wrote its own rows share, if any) before the phase fired; flush the host core's WC lines
+                        // so they are in DRAM by the time the last participant's flag-C lands.  (The workers flush
+                        // their own WC lines at the end of their drain.)
+        sfen_diag_pool().note(2, sfen_t0() - t0);
+    }
+    ++async_phases_;
+    multi_bytes += (int64_t) n * (int64_t) f.bytes;
+    // `mode_` stays 7 until the NEXT dispatch: the workers still read it (and mjobs_/mtasks_/nfmt_) while this
+    // phase is in flight, and the next dispatch - sync or async - sets it again after its parked_ == n_ wait.
+    // The synchronous run_split_multi_native resets it on return because its phase is complete by then.
+    return true;
 }
 
 void ExpertPool::run(ExpertJob* jobs, int n) {

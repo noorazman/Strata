@@ -426,14 +426,17 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
 }
 
 /// Plan v0.3 P6: the pool for a verify window.
-void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
-                      int64_t layer) {
+bool drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
+                      int64_t layer, volatile uint32_t* flagC, uint32_t want) {
     Drive* t = (Drive*) user;
     t->d.layers = layer;
+    t->d.async_flagC = flagC;   // Stage 1.6: the async rows phase raises this instead of the post-pool store
+    t->d.async_want = want;
     const Clock::time_point a = Clock::now();
     strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
     ++t->calls;
+    return t->d.rows_async;
 }
 
 int argmax(const std::vector<float>& v) {
@@ -1161,6 +1164,13 @@ int main(int argc, char** argv) {
     drive.d.hit_cpu_order = o.expert_cache_cpu_order;
     drive.d.split_rows = !o.no_split_rows;
     drive.d.pool = &pool;
+    // Stage 1.6 async rows: the fused rows phase fires without blocking the host's layer loop - the workers
+    // (and the host, when it drains) finish the rows and raise flag C themselves.  STRATA_POOL_ASYNC=0 keeps
+    // the synchronous post-pool store (the A/B arm).
+    {
+        const char* e = std::getenv("STRATA_POOL_ASYNC");
+        drive.d.async_rows_enabled = !e || std::strcmp(e, "0") != 0;
+    }
     drive.d.src = srcp;
     drive.d.n_expert = g.n_expert;
     drive.d.jobs.resize((size_t) K);
@@ -1268,10 +1278,11 @@ int main(int argc, char** argv) {
     strata::core::HitFn hit_fn =
         (o.no_pool || o.expert_cache <= 0) ? nullptr : &strata::core::expert_hit_run;
     void* pool_user = o.no_pool ? nullptr : (void*) &drive;
-    std::fprintf(stderr, "strata generate: %d expert-pool workers%s%s (worker park: %s)\n",
+    std::fprintf(stderr, "strata generate: %d expert-pool workers%s%s (worker park: %s%s)\n",
                  pool.workers(),
                  pool.host_works() ? " + the host thread" : "",
-                 o.no_pool ? " (UNUSED: --no-pool)" : "", pool.park_mode());
+                 o.no_pool ? " (UNUSED: --no-pool)" : "", pool.park_mode(),
+                 drive.d.async_rows_enabled ? ", rows: async (workers raise flag C)" : ", rows: sync (post-pool store)");
 
     // **THE MISALIGNMENT WARNING THAT STOOD HERE IS GONE, BECAUSE THE MISALIGNMENT IS FIXED.**
     //
@@ -2576,6 +2587,14 @@ int main(int argc, char** argv) {
         int64_t rounds = 0, drafts_total = 0, drafts_ok = 0, corrupt_counter = 0;
         const double pool_ms0 = drive.cpu_ms;
         const int64_t misses0 = drive.d.multi_misses, entries0 = drive.d.multi_entries;
+        // Stage 1.6 (STRATA_HEAD_DIAG=1): decompose the round-end host path that the GPU's layer-0 flag-A spin
+        // absorbs (flag A = 994 ms of 1101 ms is l0/g0 in the nsys classifier).  Stages measured here:
+        // run->commit, commit->draft (MTP), draft->apply (window setup + apply_pending), then ver.run.
+        const bool head_diag = std::getenv("STRATA_HEAD_DIAG") != nullptr && *std::getenv("STRATA_HEAD_DIAG");
+        double hd_ms_run2commit = 0.0, hd_ms_commit2draft = 0.0, hd_ms_draft2run = 0.0;
+        double hd_max1 = 0.0, hd_max2 = 0.0, hd_max3 = 0.0;
+        int64_t hd_at1 = -1, hd_at2 = -1, hd_at3 = -1;
+        Clock::time_point hd_t_run_end, hd_t_commit, hd_t_draft = Clock::now();
         while ((int64_t) produced.size() < o.max_new) {
             const Clock::time_point t0 = Clock::now();
             int T = o.spec;
@@ -2600,6 +2619,11 @@ int main(int argc, char** argv) {
             drive.d.experts = 0;
             drive.d.failed = false;
             apply_pending(false);
+            if (head_diag) {
+                const double d = std::chrono::duration<double, std::milli>(Clock::now() - hd_t_draft).count();
+                hd_ms_draft2run += d;
+                if (d > hd_max3) { hd_max3 = d; hd_at3 = rounds; }
+            }
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
@@ -2610,6 +2634,7 @@ int main(int argc, char** argv) {
                              drive.d.fail ? drive.d.fail : "(no message)");
                 return 1;
             }
+            if (head_diag) hd_t_run_end = Clock::now();
             int a = 0;
             while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
             if (first_window) {
@@ -2627,6 +2652,12 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
+            if (head_diag) {
+                const double d = std::chrono::duration<double, std::milli>(Clock::now() - hd_t_run_end).count();
+                hd_ms_run2commit += d;
+                if (d > hd_max1) { hd_max1 = d; hd_at1 = rounds; }
+                hd_t_commit = Clock::now();
+            }
             ++rounds;
             drafts_total += T - 1;
             drafts_ok += a;
@@ -2643,6 +2674,12 @@ int main(int argc, char** argv) {
             }
             const bool drafted = !use_mtp || (int64_t) produced.size() >= o.max_new ||
                                  mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
+            if (head_diag) {
+                const double d = std::chrono::duration<double, std::milli>(Clock::now() - hd_t_commit).count();
+                hd_ms_commit2draft += d;
+                if (d > hd_max2) { hd_max2 = d; hd_at2 = rounds; }
+                hd_t_draft = Clock::now();
+            }
             if (adapt_thr.joinable()) adapt_thr.join();
             if (!adapt_ok) return 1;
             if (!drafted) {
@@ -2679,6 +2716,14 @@ int main(int argc, char** argv) {
             std::printf("%-24s layer 0 (round head): wait %.3f (max %.3f)  pool %.3f (max %.3f) ms/round\n",
                         "verify round head", ver.ms_wait0 / rounds, ver.max_wait0,
                         ver.ms_pool0 / rounds, ver.max_pool0);
+        if (head_diag && rounds > 1)
+            std::printf("%-24s run->commit %.3f (max %.3f @%lld)  commit->draft(MTP) %.3f (max %.3f @%lld)  "
+                        "draft->run(window+apply) %.3f (max %.3f @%lld)  sum %.3f ms/round "
+                        "(round-end host path the GPU layer-0 flag-A spin absorbs)\n",
+                        "head diag", hd_ms_run2commit / (rounds - 1), hd_max1, (long long) hd_at1,
+                        hd_ms_commit2draft / (rounds - 1), hd_max2, (long long) hd_at2,
+                        hd_ms_draft2run / (rounds - 1), hd_max3, (long long) hd_at3,
+                        (hd_ms_run2commit + hd_ms_commit2draft + hd_ms_draft2run) / (rounds - 1));
         if (rounds > 0) {
             std::printf("%-24s slowest spins (decode-relative):  ", "verify slow layers");
             for (size_t i = 0; i < ver.top_wait.size() && i < 5; ++i)
@@ -2690,12 +2735,17 @@ int main(int argc, char** argv) {
                              ver.top_pool[i].l, ver.top_pool[i].grp, ver.top_pool[i].ms);
             std::printf("\n");
         }
-        if (rounds > 0)
+        if (rounds > 0) {
+            // The async rows phases measure their wall inside the workers (publish to flagC); fold it into the
+            // gate/up total so the rows-phases figure and the GB/s stay honest with STRATA_POOL_ASYNC.
+            const double gu_tot = pool.ms_multi_gu + pool.ms_async_wall();
             std::printf("%-24s gate/up %.3f  quantize %.3f  down %.3f ms/round; %.1f GB/s over the rows phases; "
-                        "CPU pool call %.3f ms/round\n", "pool multi", pool.ms_multi_gu / rounds,
+                        "CPU pool call %.3f ms/round%s\n", "pool multi", gu_tot / rounds,
                         pool.ms_multi_q / rounds, pool.ms_multi_down / rounds,
-                        (double) pool.multi_bytes / 1e6 / std::max(1e-9, pool.ms_multi_gu + pool.ms_multi_down),
-                        (drive.cpu_ms - pool_ms0) / rounds);
+                        (double) pool.multi_bytes / 1e6 / std::max(1e-9, gu_tot + pool.ms_multi_down),
+                        (drive.cpu_ms - pool_ms0) / rounds,
+                        pool.async_phases() > 0 ? " (rows async)" : "");
+        }
         if (rounds > 0)
             std::printf("%-24s plan %.3f  activation quantize %.3f  jobs %.3f  run %.3f ms/round\n", "dispatch",
                         drive.d.ms_plan / rounds, drive.d.ms_actq / rounds, drive.d.ms_jobs / rounds,

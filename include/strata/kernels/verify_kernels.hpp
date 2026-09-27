@@ -36,8 +36,9 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
                          const int32_t* n_keep, void* stream, int t_out_begin = 0);
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
-/// outstanding at once (the split verify window keeps two).
-void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
+/// outstanding at once (the split verify window keeps two).  `iters` (Stage 1.6 probe, optional): the kernel
+/// writes its poll-iteration count there when the wait ends, to separate a slow flag from a slow poll.
+void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream, uint64_t* iters = nullptr);
 
 /// Rows of the S2/S4/S8 embedding for T token ids read from DEVICE memory; out (T, n).  Bitwise `embedding_gather`.
 void embedding_gather_dev(const uint8_t* codes, const float* scales, const float* offsets, const int32_t* tokens,

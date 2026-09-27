@@ -415,14 +415,19 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 }
 
 namespace {
-__global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
-    while (*flag < value) __nanosleep(100);
+__global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value, uint64_t* iters) {
+    uint64_t n = 0;
+    while (*flag < value) {
+        __nanosleep(100);
+        ++n;
+    }
+    if (iters) *iters = n;   // Stage 1.6 probe: how many poll iterations the wait took
     __threadfence_system();
 }
 }  // namespace
 
-void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
-    wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
+void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream, uint64_t* iters) {
+    wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, iters);
     check("wait_flag_ge");
 }
 

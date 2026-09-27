@@ -94,6 +94,14 @@ struct ExpertDispatch {
     ExpertSource* src = nullptr;
     int64_t n_expert = strata::kernels::cpu::NE;
 
+    // Stage 1.6 async rows: the verify loop hands the layer's flag-C word and ring value to the pool callback
+    // (drive_pool_multi).  When the fused rows phase is dispatched asynchronously, the pool's last participant
+    // raises `async_flagC` to `async_want` and `rows_async` comes back true - the caller must not re-raise it.
+    volatile uint32_t* async_flagC = nullptr;
+    uint32_t async_want = 0;
+    bool async_rows_enabled = false;
+    bool rows_async = false;
+
     /// Counters, for the driver to report rather than for control flow.
     int64_t layers = 0;
     int64_t experts = 0;
