@@ -3,9 +3,11 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <immintrin.h>
 
 #include <cstdio>
@@ -16,9 +18,115 @@
 #else
 #include <pthread.h>
 #include <sched.h>
+#include <sys/syscall.h>   // SYS_futex (Stage 1.5 hybrid park)
+#include <linux/futex.h>   // FUTEX_WAIT / FUTEX_WAKE
+#include <unistd.h>
 #endif
 
 namespace strata::kernels::cpu {
+
+// Stage 1.5: the worker park policy.  The park is where a worker waits between batches; for most of the
+// program it waits with NOTHING to do, and a pure `_mm_pause` spin (the Stages 1.3/1.4 behavior) then costs
+// one whole pinned core PER WORKER at idle - 24 cores at 100 % on a box that is otherwise free.  The hybrid
+// park instead spins for a short, configurable window (fast wake for the common small inter-dispatch gaps)
+// and then FUTEX-parks on the `epoch_` word itself, so an idle pool costs ~0 CPU.  The publish paths (run,
+// run_phase, stop) bump the epoch AND futex_wake the word, which is what wakes the parked workers; a worker
+// that is woken by anything else (signal, spurious) just re-reads the epoch and keeps sleeping if it is
+// unchanged, so there is no lost-wakeup path.
+//
+//   STRATA_POOL_PARK unset           -> the DEFAULT hybrid: spin 2048us then futex (Stage 1.5 winner)
+//   STRATA_POOL_PARK "spin"          -> pure spin (legacy, byte-for-byte the old behavior; the fallback)
+//   STRATA_POOL_PARK "futex" / "0"   -> one epoch check, then futex (always-futex baseline)
+//   STRATA_POOL_PARK "<N>"           -> hybrid: spin up to N microseconds, then futex
+//
+// The default threshold (2 ms) is the measured winner of the Stage 1.5 sweep on the V100 box (24 workers,
+// E5-2680 v4): the inter-dispatch park gap is ~256us-4ms (90% in 256us-1ms), and a core that futex-parks
+// across a gap drops to the idle P-state (1.2 GHz) so its next drain runs ~2x slower (the always-futex
+// arm costs -14% decode for it).  A 2 ms spin window keeps the pinned cores at full P-state through the
+// decode gaps (decode: 48.95 tok/s vs 48.89 spin, pool 13.5 vs 13.3 ms/tok) while a 60 s idle costs
+// 24.0 -> 0.0 cores; gaps >= 2 ms (3.1% of parks) and the between-request idle still futex-park.
+//
+// Parsed once per process (the pool is constructed once); the value is process-wide, not per-pool.
+namespace {
+
+constexpr int kDefaultParkSpinUs = 2048;  // Stage 1.5 measured default (see the block above)
+
+struct ParkCfg {
+    int spin_us;        // -1: pure spin (legacy), 0: always futex, >0: hybrid (microseconds)
+    const char* desc;   // startup-log description
+};
+
+const ParkCfg& park_cfg() {
+    static const ParkCfg cfg = [] {
+        const char* e = std::getenv("STRATA_POOL_PARK");
+        if (e && std::strcmp(e, "spin") == 0) return ParkCfg{-1, "spin (legacy, opt-in)"};
+        if (e && std::strcmp(e, "futex") == 0) return ParkCfg{0, "always-futex"};
+        const bool def = !(e && *e);
+        int v = def ? kDefaultParkSpinUs : std::atoi(e);
+        if (v <= 0) return ParkCfg{0, "always-futex"};
+        if (v > 1000000) v = 1000000;
+        static char buf[64];
+        std::snprintf(buf, sizeof buf, "hybrid spin-%dus+futex%s", v, def ? " (default)" : "");
+        return ParkCfg{v, buf};
+    }();
+    return cfg;
+}
+
+bool park_futex_enabled() { return park_cfg().spin_us >= 0; }
+
+// Gap-histogram diagnostics, on only when STRATA_POOL_PARK_DIAG=1 (Stage 1.5 task 1): how long workers
+// actually wait in the park.  The bucket edges (us) are chosen around the inter-dispatch gap distribution,
+// so a threshold sweep can be read straight off the histogram.
+const bool& park_diag() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_POOL_PARK_DIAG");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
+// Park-gap histogram: 9 buckets over these us edges; bucket 8 is ">= the last edge".
+constexpr uint64_t kGapEdges[8] = {1, 4, 16, 64, 256, 1024, 4096, 16384};
+constexpr const char* kGapNames[9] = {"<1us", "1-4us", "4-16us", "16-64us", "64-256us",
+                                      "0.25-1ms", "1-4ms", "4-16ms", ">=16ms"};
+
+// The ONLY place the epoch moves.  `release` makes the jobs_/njobs_ writes visible before the bump (the
+// workers read them after seeing the new epoch); the futex wake then releases any worker parked on the word.
+// A wake with no waiters is ~100 ns, so it is unconditional whenever the futex park is in effect.
+//
+// The glibc `futex()` wrapper is not in this system's libc symbol table, so the raw syscall is used
+// (SYS_futex = 202 on x86_64); the FUTEX_WAIT/FUTEX_WAKE constants come from <linux/futex.h>.
+inline void publish_epoch(std::atomic<uint32_t>& epoch) {
+    epoch.fetch_add(1, std::memory_order_release);
+    if (park_futex_enabled()) {
+#if !defined(_WIN32)
+        ::syscall(SYS_futex, reinterpret_cast<uint32_t*>(&epoch), FUTEX_WAKE, INT_MAX,
+                  nullptr, nullptr, 0);
+#endif
+    }
+}
+
+// Park on the epoch word until it differs from `seen`.  Fast path: the epoch already moved -> return without
+// a syscall.  Slow path: futex_wait (the kernel re-checks the word under its lock, so a publish that lands
+// between our check and the wait is not lost).  `stop` is re-checked after each wake; the stop path bumps the
+// epoch through publish_epoch, so a parked worker is woken for it.
+inline void park_on_epoch(std::atomic<uint32_t>& epoch, const std::atomic<bool>& stop,
+                          uint32_t seen) {
+    for (;;) {
+        const uint32_t e = epoch.load(std::memory_order_acquire);
+        if (e != seen || stop.load(std::memory_order_relaxed)) return;
+#if !defined(_WIN32)
+        ::syscall(SYS_futex, reinterpret_cast<uint32_t*>(&epoch), FUTEX_WAIT, (unsigned) e,
+                  nullptr, nullptr, 0);
+#else
+        _mm_pause();
+#endif
+    }
+}
+
+}  // namespace
+
+const char* ExpertPool::park_mode() const { return park_cfg().desc; }
 
 std::vector<int> physical_cores(bool skip_first) {
     std::vector<int> cores;
@@ -132,9 +240,20 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works) : host_works_(h
 
 ExpertPool::~ExpertPool() {
     stop_.store(true, std::memory_order_release);
-    // Bump the epoch so a PARKED worker notices the stop flag rather than sleeping through it.
-    epoch_.fetch_add(1, std::memory_order_release);
+    // Bump the epoch (and wake any futex-parked worker) so a PARKED worker notices the stop flag rather
+    // than sleeping through it.
+    publish_epoch(epoch_);
     for (auto& t : threads_) t.join();
+    if (park_diag()) {
+        uint64_t n = park_count_.load(std::memory_order_relaxed);
+        uint64_t us = gap_total_us_.load(std::memory_order_relaxed);
+        std::fprintf(stderr, "strata pool park-gaps (diagnostics): %llu parks, %.1f ms total parked; ",
+                     (unsigned long long) n, us / 1000000.0);
+        for (int i = 0; i < 9; ++i)
+            std::fprintf(stderr, "%s:%llu%s", kGapNames[i],
+                         (unsigned long long) gap_hist_[(size_t) i].load(std::memory_order_relaxed),
+                         i < 8 ? " " : "\n");
+    }
 }
 
 void ExpertPool::worker(int id) {
@@ -144,6 +263,7 @@ void ExpertPool::worker(int id) {
     // `run()` - which waits for `parked_ == n_` before publishing - then deadlocks.  It deadlocks on the very
     // first call, which is the good case; a version that deadlocked on the second would be far worse.
     parked_.fetch_add(1, std::memory_order_acq_rel);
+    const int spin_us = park_cfg().spin_us;   // -1: pure spin (legacy), 0: always futex, >0: hybrid (us)
     for (;;) {
         // Park: wait for work.  `_mm_pause` rather than a bare spin because it yields the pipeline to the
         // sibling hyperthread; `epoch_` is bumped once per LAYER, not once per expert, so most of these
@@ -153,9 +273,47 @@ void ExpertPool::worker(int id) {
         // - a locked read-modify-write, five workers against one cache line - so the workers spent their wait
         // invalidating each other's caches and the very line the host writes to publish work.  The counter was
         // diagnostic and nothing branched on it.  See the note on the atomics in pool.hpp.
-        while (epoch_.load(std::memory_order_acquire) == seen) {
-            if (stop_.load(std::memory_order_relaxed)) return;
-            _mm_pause();
+        //
+        // Stage 1.5: the spin can be BOUNDED (STRATA_POOL_PARK=<N>us) or SKIPPED ("futex"): after the spin
+        // window the worker parks on the epoch WORD itself via futex_wait, so an idle pool costs ~0 CPU
+        // instead of one core per worker.  The publish paths wake it (publish_epoch); the park protocol
+        // (parked_/seen/drain) is unchanged, so nothing downstream of the wait is affected.
+        const auto park_t0 = park_diag() ? std::chrono::steady_clock::now()
+                                         : std::chrono::steady_clock::time_point{};
+        if (spin_us < 0) {
+            while (epoch_.load(std::memory_order_acquire) == seen) {
+                if (stop_.load(std::memory_order_relaxed)) return;
+                _mm_pause();
+            }
+        } else {
+            if (spin_us > 0) {
+                // Spin for up to `spin_us` microseconds.  The clock is checked every 1024 iterations (~2-3 us
+                // at park-loop speed) so small thresholds stay honest without paying the clock read per
+                // iteration.
+                const auto deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::microseconds(spin_us);
+                int64_t it = 0;
+                for (;;) {
+                    if (epoch_.load(std::memory_order_acquire) != seen) break;
+                    if (stop_.load(std::memory_order_relaxed)) return;
+                    _mm_pause();
+                    if (++it == 1024) {
+                        it = 0;
+                        if (std::chrono::steady_clock::now() >= deadline) break;
+                    }
+                }
+            }
+            park_on_epoch(epoch_, stop_, seen);
+        }
+        if (park_diag()) {
+            const uint64_t us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - park_t0).count();
+            int b = 8;
+            for (int i = 0; i < 8; ++i)
+                if (us < kGapEdges[i]) { b = i; break; }
+            gap_hist_[(size_t) b].fetch_add(1, std::memory_order_relaxed);
+            gap_total_us_.fetch_add(us, std::memory_order_relaxed);
+            park_count_.fetch_add(1, std::memory_order_relaxed);
         }
         if (stop_.load(std::memory_order_acquire)) return;
         seen = epoch_.load(std::memory_order_relaxed);
@@ -333,7 +491,7 @@ void ExpertPool::run_phase(int mode, int n_tasks) {
     njobs_ = n_tasks;
     head_.store(0, std::memory_order_relaxed);
     done_.store(0, std::memory_order_relaxed);
-    epoch_.fetch_add(1, std::memory_order_release);
+    publish_epoch(epoch_);   // bump + wake any futex-parked worker (Stage 1.5)
     const auto t_pub = std::chrono::steady_clock::now();
     if (host_works_) drain(-1, host_scratch_);
     const uint32_t d0 = done_.load(std::memory_order_relaxed);
@@ -481,7 +639,7 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
     mode_ = 0;
     head_.store(0, std::memory_order_relaxed);
     done_.store(0, std::memory_order_relaxed);
-    epoch_.fetch_add(1, std::memory_order_release);   // release: jobs_/njobs_ are visible before the bump
+    publish_epoch(epoch_);   // release: jobs_/njobs_ visible before the bump + wake futex-parked workers
 
     // ---- **THE HOST DRAINS TOO (R2.2), INSTEAD OF SPINNING ON `done_`.**
     //

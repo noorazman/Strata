@@ -97,6 +97,10 @@ public:
     /// Whether the host thread also drains.  Reported at startup, because "the engine adapts to the machine it
     /// is on" is only true if the engine says which adaptation it took.
     bool host_works() const { return host_works_; }
+    /// Stage 1.5: the worker park policy in effect ("spin (legacy)" / "hybrid spin-Nus+futex" / "always-futex"),
+    /// chosen by STRATA_POOL_PARK.  Reported at startup for the same reason as `host_works`: the idle-CPU
+    /// behavior the machine sees depends on it, so the engine should say which one it took.
+    const char* park_mode() const;
 
     /// Publish `n` jobs, then block until every one has been claimed AND every worker has parked.
     /// `jobs` must outlive the call (it does, and the workers never touch it afterwards).
@@ -191,6 +195,13 @@ private:
     alignas(64) std::atomic<uint32_t> parked_{0};
     alignas(64) std::atomic<uint32_t> epoch_{0};
     alignas(64) std::atomic<bool> stop_{false};
+    // Stage 1.5: park-gap histogram (diagnostics, STRATA_POOL_PARK_DIAG=1).  Each worker records how long it
+    // spent waiting in the park before a publish moved the epoch: this is the inter-dispatch gap distribution
+    // the STRATA_POOL_PARK threshold sweep is tuned against.  9 buckets over pool.cpp's kGapEdges (us).
+    // Written by workers (relaxed fetch_add), read once at destruction after the join.
+    alignas(64) std::atomic<uint64_t> gap_hist_[9] = {};
+    alignas(64) std::atomic<uint64_t> gap_total_us_{0};
+    alignas(64) std::atomic<uint64_t> park_count_{0};
     std::vector<std::thread> threads_;
     std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data
     // run_split state: mode 0 = whole experts, 1 = gate/up row parts, 2 = down row parts

@@ -193,15 +193,21 @@ def wait_idle(gpu, want_mib, timeout=90):
     return gpu_free_mib(gpu) >= want_mib
 
 
-def engine_env(gpu, args_tail):
-    """The canonical Stage 1 launch, with the caller's tail appended."""
+def engine_env(gpu, args_tail, env_extra=()):
+    """The canonical Stage 1 launch, with the caller's tail appended.
+    `env_extra` is a tuple of 'K=V' strings exported for the engine (Stage 1.5 A/B knobs)."""
+    envs = " ".join(env_extra)
+    # The env prefix goes BEFORE `timeout`: an env assignment is a shell feature, and `timeout 1500 VAR=x cmd`
+    # would execvp the literal string "VAR=x" (rc 127). `VAR=x timeout ... cmd` exports it into the timeout
+    # process, which the engine inherits.
     inner = (
         "ulimit -l unlimited; cd {repo} && "
         "CUDA_VISIBLE_DEVICES={gpu} LD_LIBRARY_PATH=/usr/local/cuda/lib64 "
-        "timeout 1500 ./build-sm70/strata --pack packs/swift-iq3_xxs "
+        "{envs}timeout 1500 ./build-sm70/strata --pack packs/swift-iq3_xxs "
         "--native {shard1} --ple-gguf {shard1} "
         "--expert-profile data/expert-profile.bin {tail}"
-    ).format(repo=REPO, gpu=gpu, shard1=SHARD1, tail=args_tail)
+    ).format(repo=REPO, gpu=gpu, shard1=SHARD1, tail=args_tail,
+             envs=(envs + " ") if envs else "")
     return inner
 
 
@@ -396,6 +402,9 @@ def main():
     ap.add_argument("--timeout", type=int, default=1500)
     ap.add_argument("--strata-flags", default="",
                     help="verbatim extra strata flags, e.g. --strata-flags \"--gpu-only-full\"")
+    ap.add_argument("--env", action="append", default=[],
+                    help="export K=V for the engine; repeatable (Stage 1.5 A/B knobs, "
+                         "e.g. --env STRATA_POOL_PARK=64)")
     a = ap.parse_args()
 
     if not (a.tokens or a.tokens_file):
@@ -439,7 +448,7 @@ def main():
         cpu_s = CpuSampler(a.label, pid_getter, stop)
         cpu_s.start()
 
-    inner = engine_env(a.gpu, tail)
+    inner = engine_env(a.gpu, tail, env_extra=tuple(a.env or ()))
     t0 = time.time()
     proc = subprocess.Popen(
         ["sudo", "-S", "-p", "", "bash", "-c", inner],
