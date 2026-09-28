@@ -162,6 +162,8 @@ private:
     float* grdown_part_ = nullptr;                            // Stage 1.7 E1: [row][token][lane] split-K down partials
     float* tail_snap_ = nullptr;                              // per QSA layer
     int32_t* sel_ = nullptr;
+    uint16_t *slow_ks_ = nullptr, *slow_vs_ = nullptr;        // Stage 1.7 E4: gathered-KV scratch for the slow attention A/B
+    float* slow_cells_ = nullptr;                             // Stage 1.7 E4: per-token cell-score row for the slow selection A/B
     float *logits_ = nullptr, *w_ = nullptr, *shared_ = nullptr, *parts_ = nullptr, *hit_out_ = nullptr;
     int32_t *ids_ = nullptr, *hit_slot_ = nullptr, *hit_dst_ = nullptr, *hit_count_ = nullptr;
     int32_t* plan_ = nullptr;                                     // device copy of the plan block

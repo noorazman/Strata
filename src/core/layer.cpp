@@ -443,16 +443,20 @@ bool layer_verify_compatible(std::string& why) {
     if (!native_bf16_projections) why = "the native BF16 projections are off";
     else if (!g_fused_gr) why = "the fused hyper-connection read is off";
     else if (!g_fused_gdn || !strata::kernels::native_gdn_enabled()) why = "the fused native GDN kernels are off";
-    else if (!g_fast_attn || native_flash_attn_short) why = "the split-K decode attention is off";
-    else if (!g_fast_select) why = "the block top-k selection is off";
+    else if (native_flash_attn_short) why = "the short flash-attention adapter is on";
     else if (!strata::kernels::native_qsa_indexer_enabled()) why = "the native QSA indexer is off";
     else return true;
+    // Stage 1.7 E4: `g_fast_attn` / `g_fast_select` no longer gate the verify window - the window reproduces the
+    // fast OR the slow (gather + one-block-per-head / cell top-k) QSA arithmetic, selected by the same flags the
+    // session path uses, so `--no-fast-attn` / `--no-fast-select` A/B the attention inside the verify window.
     return false;
 }
 void layer_set_publish_kernel(bool enabled) { g_publish_kernel = enabled; }
 void layer_set_fused_gdn(bool enabled) { g_fused_gdn = enabled; }
 void layer_set_fast_select(bool enabled) { g_fast_select = enabled; }
+bool layer_fast_select() { return g_fast_select; }
 void layer_set_fast_attn(bool enabled) { g_fast_attn = enabled; }
+bool layer_fast_attn() { return g_fast_attn; }
 void layer_set_fused_gr(bool enabled) { g_fused_gr = enabled; }
 bool layer_fused_gr() { return g_fused_gr; }
 void layer_set_shared_early(bool enabled) { g_shared_early = enabled; }

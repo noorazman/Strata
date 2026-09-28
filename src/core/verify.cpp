@@ -223,6 +223,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     cap_ = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     max_blocks_ = ss.qsa_states[0].max_cells / s.idx_block + 2;
     attn_scratch_floats_ = (int64_t) strata::kernels::qsa_decode_attn_scratch_floats(cap_, s);
+    const uint64_t qsa_max_cells = (uint64_t) ss.qsa_states[0].max_cells;   // Stage 1.7 E4: slow-selection score row
 
     const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, K = (uint64_t) ss.k;
     const uint64_t C = (uint64_t) g.ssm_conv_channels, ZV = (uint64_t) g.ssm_value_dim, HV = (uint64_t) g.ssm_v_heads;
@@ -301,6 +302,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         scores_ = b.take<float>(T * (uint64_t) max_blocks_); sel_ = b.take<int32_t>(T * (uint64_t) cap_);
         attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);
         attn_scratch_ = b.take<float>(T * (uint64_t) attn_scratch_floats_);
+        slow_ks_ = b.take<uint16_t>((uint64_t) cap_ * NKV * HD);   // Stage 1.7 E4: slow-attention A/B gather scratch
+        slow_vs_ = b.take<uint16_t>((uint64_t) cap_ * NKV * HD);
+        slow_cells_ = b.take<float>(qsa_max_cells);                // Stage 1.7 E4: slow-selection per-token score row
         tail_snap_ = b.take<float>(nQ * TS);
         logits_ = b.take<float>(T * (uint64_t) g.n_expert); w_ = b.take<float>(T * K); ids_ = b.take<int32_t>(T * K);
         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
@@ -547,16 +551,43 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wiq->data, qx, (int) N, (int) (IQ * ID), cs);
                     norm_rope(qx, wiqn, (int) IQ, (int) ID, pos_ + t * NH);
                 }
-                qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n, max_blocks_,
-                                 s, scores_ + (size_t) tb * max_blocks_, cs);
-                qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
-                               sel_ + (size_t) tb * cap_, cs);
-                QsaAttnPools pools;
-                pools.page_table = st.page_table;
-                if (st.kv_int8) { pools.k_q = st.k_q; pools.v_q = st.v_q; pools.k_scale = st.k_scale; pools.v_scale = st.v_scale; }
-                else { pools.k_pool = st.k_pool; pools.v_pool = st.v_pool; }
-                qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_,
-                                      s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
+                if (layer_fast_select()) {
+                    qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n,
+                                     max_blocks_, s, scores_ + (size_t) tb * max_blocks_, cs);
+                    qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
+                                   sel_ + (size_t) tb * cap_, cs);
+                } else {
+                    // Stage 1.7 E4: the slow (P2.S2) selection, one 1-token step per token.  `slow_cells_` holds the
+                    // full per-token cell-score row (max_cells) reused across t; same stream, so sequential.
+                    for (int t = tb; t < te; ++t) {
+                        qsa_index_step(st.idx_pooled, qidx_ + t * IQ * ID, nullptr, s, step_ + t * kStepCount,
+                                       max_blocks_, slow_cells_, cs);
+                        topk_512_step(slow_cells_, s, cap_, step_ + t * kStepCount, sel_ + (size_t) t * cap_, cs);
+                    }
+                }
+                if (layer_fast_attn()) {
+                    QsaAttnPools pools;
+                    pools.page_table = st.page_table;
+                    if (st.kv_int8) { pools.k_q = st.k_q; pools.v_q = st.v_q; pools.k_scale = st.k_scale; pools.v_scale = st.v_scale; }
+                    else { pools.k_pool = st.k_pool; pools.v_pool = st.v_pool; }
+                    qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount,
+                                          cap_, s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD,
+                                          n, cs);
+                } else {
+                    // Stage 1.7 E4: the slow (P2.S2) attention - gather the selected cells into scratch, then one
+                    // block per query head over the scratch - one 1-token step per token.
+                    for (int t = tb; t < te; ++t) {
+                        if (st.kv_int8)
+                            kv_gather_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table,
+                                              sel_ + (size_t) t * cap_, step_ + t * kStepCount, cap_, s, slow_ks_,
+                                              slow_vs_, cs);
+                        else
+                            kv_gather_step(st.k_pool, st.v_pool, st.page_table, sel_ + (size_t) t * cap_,
+                                           step_ + t * kStepCount, cap_, s, slow_ks_, slow_vs_, cs);
+                        qsa_attend_step(qcur_ + t * NH * HD, slow_ks_, slow_vs_, step_ + t * kStepCount, cap_, s,
+                                        attn_ + t * NH * HD, nullptr, cs);
+                    }
+                }
                 for (int t = tb; t < te; ++t) {
                     if (native_qsa_enabled())
                         native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD,

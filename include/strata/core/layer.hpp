@@ -407,6 +407,7 @@ bool layer_fused_gr();
 /// Plan v0.3 P3/P7: QSA attention by the split-K kernel reading the KV pools directly (default ON; `false` keeps
 /// the gather + one-block-per-head kernel).  Set before capture.
 void layer_set_fast_attn(bool enabled);
+bool layer_fast_attn();
 /// Plan v0.3 P3: doorbell payload + ring as one kernel, QSA step staging read by a kernel from mapped memory
 /// (default ON; `false` keeps the memcpy nodes).  Set before capture.
 void layer_set_publish_kernel(bool enabled);
@@ -415,6 +416,7 @@ void layer_set_fused_gdn(bool enabled);
 /// Plan v0.3 P7: QSA block scores in FP32 and a radix top-k over blocks (default ON; `false` = the FP64 row scores
 /// and the bit-serial cell top-k).  Set before capture.
 void layer_set_fast_select(bool enabled);
+bool layer_fast_select();
 /// Plan v0.3 P6: whether the current decode configuration is the one the speculative verify window reproduces
 /// bit for bit (native projections, fused GR and GDN, split-K attention, block selection, native indexer).
 bool layer_verify_compatible(std::string& why);
