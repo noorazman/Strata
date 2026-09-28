@@ -2,6 +2,61 @@
 
 Important historical changes and decisions. No raw logs.
 
+## 2026 — V100 Stage 1.8 (branch `stage1.3-expert-pool-sync`, GPU0 only)
+
+QSA attention-path analysis (profile-only stage, no engine changes; binary `0fea54d`).
+Question: can attention be meaningfully accelerated on V100 SM70 before implementing
+anything? Verdict: **the QSA attention mechanism is 5.8 % of the token (ceiling ~7 % e2e);
+the pure attention kernel is 0.8 % (ceiling ~1 %). Attention is not a major e2e bottleneck.**
+
+- **Full QSA path breakdown (nsys, `--cuda-graph-trace=node`, 64-tok window, 4 arms,
+  stream-order segment decoder `bench/v100/s18_trace.py`).** Main-stream kernel time
+  22,731 µs/tok (fp16 base) / 22,644 (int8). QSA attention mechanism (projections +
+  indexer + selection + attention + small kernels, MoE tail excluded) = **1,317 µs/tok**:
+  Q GEMV 287.2, attn_chunk 155.2 (33.1 µs/call, 66 blocks single wave), O GEMV 147.4,
+  Q/idxq norm 90.1, idxq proj 89.5, Q/idxq rope 68.7, idxk proj 68.5, attn quant 51.6,
+  K norm 46.8, KV append 45.8, K GEMV 40.4, idxk append 38.8, gate 38.0, K rope 35.2,
+  V GEMV 33.7, attn merge 27.4, sel block scores 17.7, staging 13.3, act quant 11.5,
+  sel block topk 10.7. int8 mechanism 1,356 µs/tok (+3 %, int8 KV ≈ fp16 KV speed).
+- **Fast-vs-slow A/B (E4 `--no-fast-attn`/`--no-fast-select`, 256 tok, `drop_caches`).**
+  fp16 base 49.15/49.86/49.11 tok/s all GOLDEN `c1517d…`; nofastattn 46.30/45.00/44.40
+  (−8.4 %, trajectory diverges tok 42, kernel +912 µs/tok, slow attention 6.0× fast core
+  per invocation); nofastsel 47.35/47.43/48.46 (−3.3 %, **bit-identical trajectory** =
+  pure cost, +624 µs/tok, slow selection 23× fast); int8 base 48.60; int8 nofastattn
+  43.81 (−9.9 %); int8 nofastsel **20.17 (−58.6 %)** — MTP draft 8.591 vs 1.969 ms/round
+  + degenerate loop at tok 221; slow selection is a diagnostic arm only under int8.
+  All 15 runs rc=0, 3/3 deterministic per fp16 arm, no CUDA errors/hangs.
+- **Attention-kernel microbench (SM70, production shape G=12/HD=256/CHUNK=64/256 thr,
+  66 blocks, 4.33 MB/launch).** Production-structure replica 33.7 µs/launch (2,057
+  GFLOP/s = 13 % FP32 peak, 128 GB/s = 14 % HBM; roofline 5–8 µs → latency-bound).
+  Naive WMMA fp16 54.9 µs (slower: 12→16 row padding + 3 syncs + shared staging);
+  register-resident WMMA 30.5 µs (marginal, needs fp16 Q = numerics change); CHUNK
+  sweep on the production structure: c32 25.2 µs (−25 %), c16 23.4 µs (−31 %), c128
+  59.8 µs — **chunk size is the one free lever (no numerics change)**. Toolchain note:
+  `wmma::load/store_matrix_sync` from/to local (register) memory faults on CUDA
+  12.8/12.9 sm_70 (`unspecified launch failure`); stage through shared memory.
+- **Theoretical max e2e gain:** whole QSA mechanism → 0 = 5,185 − 337 ms → 52.8 tok/s
+  (+6.9 % fp16 / +7.1 % int8); attention core → 0 = +0.9 %; core 4× faster = +0.7 %.
+- **Rejected by measurement:** WMMA fp16 now (54.9/30.5 vs 33.7 µs — no clear win, 25 %
+  mma waste, needs fp16-Q mode; kept open for a later int8-TC experiment), FlashAttention
+  rewrite (kernel is already tiled 64-cell + online softmax via merge), KV-cache layout
+  (KV append 46 µs/tok; int8 already neutral for attention), bigger GEMV batches (already
+  T-batched per verify window).
+- **Largest single finding (not attention):** `wait_flag_ge` spin = 7,868 µs/tok = 34 %
+  of the main stream (503.5 ms in the 64-tok window) — the largest decode kernel class,
+  larger than the whole QSA mechanism. Structural: wait calls per layer-round 1.0 (old
+  binary, s17x) → 3.0 (new); spin per layer-round 309 → 420 µs. Flag A/B/C re-attribution
+  on the new binary is the top next-stage profiling item.
+- **Proposed next experiment (NOT implemented):** E1 = `STRATA_QSA_CHUNK` knob (64
+  default, 32 opt-in): expect chunk 33.7 → ~25 µs, e2e +0.1–0.15 tok/s; golden-gated
+  (the online-softmax merge is partition-invariant — verify bit-identity, don't assume).
+  Follow-ups ranked: Q/O int8-TC GEMV path (targets 508 µs/tok of projections, +1–1.2 %
+  e2e, opt-in), small-kernel fusion (ceiling ~1.5–2 %, cuts ~96 launches/tok), wait_flag
+  re-attribution.
+- Deliverables: `Docs/v100-stage1.8-attention-analysis.md`, `bench/v100/s18{e4,e4b,nsys}.sh`,
+  `bench/v100/s18check.py`, `bench/v100/s18_trace.py`, raw data `Logs/benchmarks/s18e4*.{json,log}`
+  + `Logs/benchmarks/s18e4b-campaign.log` + `Logs/gpu/s18nsys-{base,nofastattn,nofastsel,int8-base}.{nsys-rep,sqlite}`.
+
 ## 2026 — V100 Stage 1.7 (branch `stage1.3-expert-pool-sync`, GPU0 only)
 
 GPU kernel experiments: profiled the decode GPU kernel breakdown, ran three env-gated
