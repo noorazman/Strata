@@ -46,6 +46,21 @@ void fused_gr_read(const FusedGrArgs& a, void* stream);
 /// weight pointers and eps must be the same for every t); `xn_scratch` is n_tok * hc * n_embd floats.  Every
 /// token's outputs are bitwise `fused_gr_read(a[t])`.
 constexpr int kFusedGrMaxT = 8;
-void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream);
+
+/// Stage 1.7 E1: the down projection runs K-split over four 8-lane groups per row (4x the blocks, the per-lane
+/// 40-chunk accumulation chains and the 5-level xor reduction tree are UNCHANGED, so the sums stay bitwise the
+/// single-kernel ones).  `down_part_scratch` is `kFusedGrDownPartFloats` floats, layout [row][token][lane] over
+/// `kFusedGrDownRows` rows (40 blocks x 8 rows + 4 inject rows).  It may be null only when E1 is disabled
+/// (`STRATA_GR_DOWN_SPLIT` unset / `=0`, the legacy single-kernel path - the DEFAULT after the 2026-09-28 revert).
+constexpr int kFusedGrDownKSplit = 4;
+constexpr int kFusedGrDownRows = 324;
+constexpr uint64_t kFusedGrDownPartFloats = (uint64_t) kFusedGrDownRows * kFusedGrMaxT * 32;
+
+/// Stage 1.7 E1 gate (read once, process lifetime): true when `STRATA_GR_DOWN_SPLIT=1`.  OFF by default after the
+/// 2026-09-28 revert (the split+reduce measured +133.1 ms over a 256-token decode).  The core sizes the
+/// `kFusedGrDownPartFloats` scratch from this same gate so allocation and use always agree.
+bool fused_gr_down_split_enabled();
+
+void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, float* down_part_scratch, void* stream);
 
 }  // namespace strata::kernels

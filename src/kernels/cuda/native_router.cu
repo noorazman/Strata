@@ -94,6 +94,103 @@ __global__ void route(const float* __restrict__ logits, int32_t* __restrict__ id
     const float inverse_selected_sum = 1.0f / selected_sum;
     if (lane < 10) weights[lane] = selected * inverse_selected_sum;
 }
+
+// Stage 1.7 E3: the same top-10 with the serial 10 x (16-scan + 5-shfl) selection replaced by a per-lane
+// 16-element bitonic sort of the (value, id) pairs plus 10 head-pop rounds.  The total order (value
+// descending, id ascending - the exact order the iterative argmax's tie-break implements) has no equal keys
+// (ids are unique), so the sorted list IS the ranked list: every round's global winner, and therefore every
+// ids[rank], every per-lane selected_sum accumulation (still in selection order, still by winning-expert lane)
+// and the epilogue, is bitwise the `route` kernel's.  The softmax phase is byte-for-byte the same code.
+struct RouterVI { float v; unsigned i; };
+__device__ __forceinline__ bool router_vi_before(const RouterVI& a, const RouterVI& b) {
+    return a.v > b.v || (a.v == b.v && a.i < b.i);
+}
+// The 16-element bitonic sorting network (80 compare-exchanges), generated and exhaustively verified on the
+// host against the strict total order (value desc, id asc): first half Best-sorted, second half !Best-sorted,
+// then the full merge (compare-exchange pass over the half, then the two halves merged recursively - a single
+// pass is NOT a merge).  Fully unrolled at compile time.
+template <bool Up>
+__device__ __forceinline__ void router_ce(RouterVI* a, int p, int q) {
+    if (Up) {
+        if (router_vi_before(a[q], a[p])) { RouterVI t = a[p]; a[p] = a[q]; a[q] = t; }
+    } else {
+        if (router_vi_before(a[p], a[q])) { RouterVI t = a[p]; a[p] = a[q]; a[q] = t; }
+    }
+}
+template <int H, bool Up>
+__device__ __forceinline__ void router_merge(RouterVI* a) {
+    if constexpr (H > 1) {
+        for (int i = 0; i < H; ++i) router_ce<Up>(a, i, i + H);
+        router_merge<H / 2, Up>(a);
+        router_merge<H / 2, Up>(a + H);
+    } else {
+        router_ce<Up>(a, 0, 1);
+    }
+}
+template <int N, bool Best>
+__device__ __forceinline__ void router_bitonic(RouterVI* a) {
+    if constexpr (N > 1) {
+        router_bitonic<N / 2, Best>(a);
+        router_bitonic<N / 2, !Best>(a + N / 2);
+        router_merge<N / 2, Best>(a);
+    }
+}
+__global__ void route_sort(const float* __restrict__ logits, int32_t* __restrict__ ids,
+                           float* __restrict__ weights) {
+    if (threadIdx.y != 0) return;
+    const int lane = threadIdx.x;
+    float values[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) values[i] = logits[lane + i * 32];
+    __syncthreads();
+    float maximum = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) maximum = max(maximum, values[i]);
+    maximum = warp_max(maximum);
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        values[i] = expf(values[i] - maximum);
+        sum += values[i];
+    }
+    const float reciprocal = 1.0f / warp_sum(sum);
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        values[i] *= reciprocal;
+        if (__isnanf(values[i])) values[i] = -FLT_MAX;
+    }
+    // element i's id is lane + i * 32, so id-ascending ties resolve exactly like the iterative scan's
+    // strict `>` (the earlier i).
+    RouterVI el[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) el[i] = {values[i], (unsigned) i};
+    router_bitonic<16, true>(el);
+    float selected = 0.0f, selected_sum = 0.0f;
+    int head = 0;   // this lane's wins so far: its popped elements
+#pragma unroll
+    for (int rank = 0; rank < 10; ++rank) {
+        float best = el[head].v;
+        int expert = lane + (int) el[head].i * 32;
+#pragma unroll
+        for (int mask = 16; mask; mask >>= 1) {
+            const float other = __shfl_xor_sync(0xffffffffu, best, mask, 32);
+            const int other_id = __shfl_xor_sync(0xffffffffu, expert, mask, 32);
+            if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
+        }
+        const bool mine = (expert & 31) == lane;
+        if (mine) {
+            ids[rank] = expert;
+            // Deliberately accumulate by WINNING EXPERT lane, not output rank.
+            // Multiple selected experts in one lane add in selection order.
+            selected_sum += best;
+            ++head;
+        }
+        if (rank == lane) selected = best;
+    }
+    selected_sum = max(warp_sum(selected_sum), 6.103515625e-5f);
+    const float inverse_selected_sum = 1.0f / selected_sum;
+    if (lane < 10) weights[lane] = selected * inverse_selected_sum;
+}
 bool valid(const void* p, size_t bytes) {
     const auto address = reinterpret_cast<uintptr_t>(p);
     return p && address % 4 == 0 && bytes <= UINTPTR_MAX - address;
@@ -110,7 +207,13 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, void
         || overlap(logits, 512 * 4, ids, 10 * 4) || overlap(logits, 512 * 4, weights, 10 * 4)
         || overlap(ids, 10 * 4, weights, 10 * 4))
         throw std::invalid_argument("native router requires a stream, aligned spans, and disjoint outputs");
-    route<<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
+    static const int sort = [] {
+        const char* e = std::getenv("STRATA_ROUTE_SORT");
+        return e && *e == '1';      // Stage 1.7 E3: bitonic-sort selection, OFF by default (reverted: +100.0 ms over 256 tok); =1 re-enables
+    }();
+    const cudaStream_t st = static_cast<cudaStream_t>(stream);
+    if (sort) route_sort<<<1, dim3(32, 8), 0, st>>>(logits, ids, weights);
+    else route<<<1, dim3(32, 8), 0, st>>>(logits, ids, weights);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

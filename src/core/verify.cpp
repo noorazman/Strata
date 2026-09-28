@@ -288,6 +288,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         mixed_ = b.take<float>(T * N); bo_ = b.take<float>(T * N);
         inj_ = b.take<float>(T * HC); inj2_ = b.take<float>(T * HC);
         lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); xn_ = b.take<float>(T * HC * N);
+        grdown_part_ = strata::kernels::fused_gr_down_split_enabled()
+                           ? b.take<float>(strata::kernels::kFusedGrDownPartFloats)
+                           : nullptr;   // Stage 1.7 E1: split-K down partials, reserved only when STRATA_GR_DOWN_SPLIT=1
         xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
         qkv_L_ = b.take<float>(nG * T * C); h_L_ = b.take<float>(nG * T * C);
         gate_L_ = b.take<float>(nG * T * HV); beta_L_ = b.take<float>(nG * T * HV);
@@ -452,7 +455,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.eps = EPS; a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC;
                 a.inject_out = inj_out + t * HC; a.mixed = mixed_ + t * N;
             }
-            fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs);
+            fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, grdown_part_, cs);
         };
         gr_read_group(0, pending, inj2_, inj_);
         float* xm = mixed_ + tb * N;

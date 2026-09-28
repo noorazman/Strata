@@ -134,6 +134,7 @@ __global__ void __launch_bounds__(THREADS) gr_up_kernel(FusedGrArgs a) {
 struct GrMulti {
     FusedGrArgs a[kFusedGrMaxT];
     float* xn;
+    float* part;   // Stage 1.7 E1: [row][token][lane] split-K down partials (kFusedGrDownPartFloats)
     int T;
 };
 
@@ -176,6 +177,49 @@ __global__ void __launch_bounds__(THREADS) gr_norm_multi_kernel(GrMulti m) {
     }
     __syncthreads();
     for (int i = t; i < D; i += THREADS) xn[i] *= s_rs[i / N];
+}
+
+// Stage 1.7 E2: `gr_norm_multi_kernel` with one block per (token, stream) instead of one per token.  Stream s
+// owns the contiguous float range [s*N, (s+1)*N) (= float4 [640s, 640(s+1))), and the kernel's per-lane
+// sum-of-squares chain is the stride-256 pattern f4 = t + 256k RESTRICTED to that range in f4 order - so each
+// block recomputes the single-block kernel's per-lane stream-s partial bit for bit, then the same 5-level xor
+// tree, the same w-ordered 8-warp sum, the same rsqrt, and an elementwise xn scale (order-free).  T blocks ->
+// T*HC blocks; the profile's dominant T=1 case goes from one 256-thread block on 90 SMs to four.
+__global__ void __launch_bounds__(THREADS) gr_norm_multi_split_kernel(GrMulti m) {
+    __shared__ float part[WARPS];
+    __shared__ float s_rs;
+    const int tok = blockIdx.x / HC, s = blockIdx.x - (blockIdx.x / HC) * HC;
+    const FusedGrArgs& a = m.a[tok];
+    const int f0 = 640 * s;               // stream s's float4 range, global f4 index
+    float* xn = m.xn + ((size_t) tok * D + s * N);
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[s] / (float) HC) : 0.0f;
+    float ss = 0.0f;
+    for (int f4 = t; f4 < f0 + 640; f4 += 256) {
+        if (f4 < f0) continue;
+        const int i = f4 * 4;
+        float4 r = *reinterpret_cast<const float4*>(a.R + i);
+        if (a.apply) {
+            const float4 b = *reinterpret_cast<const float4*>(a.bo_prev + i - s * N);
+            r.x = fmaf(b.x, gw, r.x); r.y = fmaf(b.y, gw, r.y);
+            r.z = fmaf(b.z, gw, r.z); r.w = fmaf(b.w, gw, r.w);
+        }
+        const float4 g = *reinterpret_cast<const float4*>(a.w_norm + i);
+        const float sq = r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
+        ss += sq;
+        *reinterpret_cast<float4*>(xn + i - s * N) = make_float4(r.x * g.x, r.y * g.y, r.z * g.z, r.w * g.w);
+    }
+    const float v = warp_sum(ss);
+    if (lane == 0) part[warp] = v;
+    __syncthreads();
+    if (t == 0) {
+        float sum = 0.0f;
+        for (int w = 0; w < WARPS; ++w) sum += part[w];
+        s_rs = rsqrtf(sum / (float) N + a.eps);
+        a.rs[s] = s_rs;
+    }
+    __syncthreads();
+    for (int i = t; i < N; i += THREADS) xn[i] *= s_rs;
 }
 
 constexpr int TILE = 2560;             // xn floats per token staged at a time: 320 chunks of 8, 10 per lane
@@ -232,6 +276,96 @@ __global__ void __launch_bounds__(THREADS) gr_down_multi_kernel(GrMulti m) {
         } else {
             const float x = s[k] / (float) HC;
             m.a[k].lo[row] = x / (1.0f + __expf(-x));
+        }
+    }
+}
+
+// ================================ Stage 1.7 E1: K-split down (bitwise) ================================
+// The single-kernel `gr_down_multi_kernel` runs 41 blocks (one 8-warp block per 8 rows), each lane accumulating
+// its 40 weight chunks (4 tiles x 10) in a flat left-associative chain, then a 5-level xor tree.  The GPU floor
+// profile shows it latency-bound at 541 ms (9.3 % of decode busy).  Here the 32 lanes of a row split into four
+// 8-lane groups: block (b, g) of grid (DOWN_BLOCKS+1) x kFusedGrDownKSplit runs row b's lane group g and computes
+// each of its 8 lanes' FULL 40-chunk chain - the same chunks, the same (base, q) order, the same fmas - publishing
+// the per-lane partials.  `gr_down_multi_reduce_kernel` then replays the SAME 5-level xor tree (offsets
+// 16, 8, 4, 2, 1) over the 32 published lane values, so every sum, and every epilogue, is bitwise the
+// single-kernel one: only the parallelism moved (41 blocks -> 164, each doing a quarter of the dots and a
+// quarter of the weight bytes).
+__global__ void __launch_bounds__(THREADS) gr_down_multi_split_kernel(GrMulti m) {
+    extern __shared__ __align__(16) float tile[];   // this block's 8-lane group: [T][TQ][16 float4]
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int T = m.T;
+    const int b = blockIdx.x / kFusedGrDownKSplit;
+    const int g = blockIdx.x - b * kFusedGrDownKSplit;   // this block's 8-lane group (0..3)
+    const bool mine = (lane >> 3) == g;                  // the group's 8 lanes: 8g .. 8g+7
+    const int i = lane & 7;                              // slot within the group
+    const int l = g * 8 + i;                             // this lane's chunk id (0..31), as the single kernel's `lane`
+    const bool inject_block = b == DOWN_BLOCKS;
+    const int down_row = b * WARPS + warp;
+    const int weight_row = inject_block ? warp : down_row;                 // weight-matrix row (w_inject[warp] / w_down[down_row])
+    const int part_row = inject_block ? DOWN_BLOCKS * WARPS + warp : down_row;   // part layout: 320 down rows, THEN the 4 inject rows
+    const bool active = mine && !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
+    const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active ? weight_row : 0) * D;
+    const uint4* w4 = reinterpret_cast<const uint4*>(wrow);
+    float acc[kFusedGrMaxT];
+#pragma unroll
+    for (int k = 0; k < kFusedGrMaxT; ++k) acc[k] = 0.0f;
+    const float4* src4 = reinterpret_cast<const float4*>(m.xn);
+    float4* tile4 = reinterpret_cast<float4*>(tile);
+    for (int base = 0; base < D; base += TILE) {
+        uint4 wv[TQ];
+        if (active) {
+#pragma unroll
+            for (int q = 0; q < TQ; ++q) wv[q] = __ldg(w4 + base / 8 + l + 32 * q);
+        }
+        __syncthreads();
+        // the group's 8 chunk windows per (token, q): 16 float4 each, floats 64*g + 256*q .. +63 of the tile
+#pragma unroll 4
+        for (int n = t; n < T * TQ * 16; n += THREADS) {
+            const int k = n / (TQ * 16), r = n - k * (TQ * 16), q = r / 16, c = r - q * 16;
+            tile4[n] = src4[((size_t) k * D + base) / 4 + 16 * g + 64 * q + c];
+        }
+        __syncthreads();
+        if (!active) continue;
+#pragma unroll
+        for (int q = 0; q < TQ; ++q) {
+#pragma unroll
+            for (int k = 0; k < kFusedGrMaxT; ++k)
+                if (k < T) acc[k] += dot8(wv[q], tile + k * TQ * 64 + q * 64 + i * 8);
+        }
+    }
+    if (!active) return;
+    float* part = m.part + (size_t) part_row * kFusedGrMaxT * 32;
+#pragma unroll
+    for (int k = 0; k < kFusedGrMaxT; ++k)
+        if (k < T) part[(size_t) k * 32 + l] = acc[k];
+}
+
+// The join: one warp per row replays the 5-level xor tree over the 32 published per-lane values (bitwise the
+// single kernel's `warp_sum(acc[k])`), then the same lane-k-writes-token-k epilogue.
+__global__ void __launch_bounds__(THREADS) gr_down_multi_reduce_kernel(GrMulti m) {
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int T = m.T;
+    const bool inject_block = blockIdx.x == DOWN_BLOCKS;
+    const int down_row = blockIdx.x * WARPS + warp;
+    const int part_row = inject_block ? DOWN_BLOCKS * WARPS + warp : down_row;   // 320 down rows, THEN the 4 inject rows
+    if (inject_block && (m.a[0].w_inject == nullptr || warp >= HC)) return;
+    const float* part = m.part + (size_t) part_row * kFusedGrMaxT * 32;
+    float s[kFusedGrMaxT];
+#pragma unroll
+    for (int k = 0; k < kFusedGrMaxT; ++k) {
+        float v = part[(size_t) k * 32 + lane];
+#pragma unroll
+        for (int mask = 16; mask; mask >>= 1) v += __shfl_xor_sync(0xffffffffu, v, mask, 32);
+        s[k] = k < T ? v : 0.0f;
+    }
+#pragma unroll
+    for (int k = 0; k < kFusedGrMaxT; ++k) {
+        if (k >= T || lane != k) continue;
+        if (inject_block) {
+            m.a[k].inject_out[warp] = s[k];
+        } else {
+            const float x = s[k] / (float) HC;
+            m.a[k].lo[down_row] = x / (1.0f + __expf(-x));
         }
     }
 }
@@ -295,8 +429,21 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
 
 }  // namespace
 
-void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream) {
-    if (n_tok < 1 || n_tok > kFusedGrMaxT || xn_scratch == nullptr) {
+// Stage 1.7 E1: the K-split down gate, read once for the process lifetime.  OFF by default (reverted
+// 2026-09-28: split+reduce measured +133.1 ms over a 256-token decode); `STRATA_GR_DOWN_SPLIT=1`
+// re-enables the experiment.  The core allocates the `kFusedGrDownPartFloats` scratch from this same
+// gate, so the two always agree.
+bool fused_gr_down_split_enabled() {
+    static const int on = [] {
+        const char* e = std::getenv("STRATA_GR_DOWN_SPLIT");
+        return e && *e == '1';
+    }();
+    return on != 0;
+}
+
+void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, float* down_part_scratch, void* stream) {
+    const int down_split = fused_gr_down_split_enabled() ? 1 : 0;
+    if (n_tok < 1 || n_tok > kFusedGrMaxT || xn_scratch == nullptr || (down_split && down_part_scratch == nullptr)) {
         std::fprintf(stderr, "fused_gr_read_multi: invalid arguments\n");
         std::exit(1);
     }
@@ -311,17 +458,31 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
             std::exit(1);
         }
     }
+    static const int norm_split = [] {
+        const char* e = std::getenv("STRATA_GR_NORM_SPLIT");
+        return !(e && *e == '0');   // Stage 1.7 E2: RETAINED default (per-stream norm, -69.8 ms over 256 tok); =0 keeps the single block
+    }();
     m.xn = xn_scratch;
+    m.part = down_part_scratch;
     m.T = n_tok;
     cudaStream_t st = (cudaStream_t) stream;
-    gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
+    if (norm_split) gr_norm_multi_split_kernel<<<n_tok * HC, THREADS, 0, st>>>(m);
+    else gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
     static bool attr = false;
     if (!attr) {
         cudaFuncSetAttribute(gr_down_multi_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int) (kFusedGrMaxT * TILE * sizeof(float)));
+        cudaFuncSetAttribute(gr_down_multi_split_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int) (kFusedGrMaxT * TQ * 64 * sizeof(float)));
         attr = true;
     }
-    gr_down_multi_kernel<<<DOWN_BLOCKS + 1, THREADS, (size_t) n_tok * TILE * sizeof(float), st>>>(m);
+    if (down_split) {
+        gr_down_multi_split_kernel<<<(DOWN_BLOCKS + 1) * kFusedGrDownKSplit, THREADS,
+                                     (size_t) n_tok * TQ * 64 * sizeof(float), st>>>(m);
+        gr_down_multi_reduce_kernel<<<DOWN_BLOCKS + 1, THREADS, 0, st>>>(m);
+    } else {
+        gr_down_multi_kernel<<<DOWN_BLOCKS + 1, THREADS, (size_t) n_tok * TILE * sizeof(float), st>>>(m);
+    }
     gr_up_multi_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
