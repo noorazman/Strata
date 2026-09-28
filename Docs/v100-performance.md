@@ -310,3 +310,39 @@ full WC (ymiss/plan back to WB). Correctness: 32/32 golden every run; 256/256 de
 16 GB (GPU4) 48.87 tok/s, first-32 golden, 96/256 cross-card diffs (≈108 pre-existing);
 ctest 20/22. **Remaining bottleneck:** the ~13 ms round-head flag-C visibility lag (documented,
 not fully fixable in software). Doc: `Docs/v100-stage1.6-final.md`.
+
+## Stage 1.7 — GPU kernel experiments (GPU0 only; E2 kept, E1/E3 reverted)
+
+Profiled the decode GPU kernel breakdown, ran three env-gated kernel experiments, and
+root-caused the all-on regression. Production target is the 32 GB V100 (GPU0) only;
+16 GB (GPU4) not validated this stage.
+
+- **KEEP E2** `STRATA_GR_NORM_SPLIT` (per-stream gr_norm split) — **default ON**. Norm
+  kernel 14.04 → 7.86 µs (−44 %, −69.8 ms over a 256-token decode); bitwise-identical,
+  no VRAM added.
+- **REVERT E1** `STRATA_GR_DOWN_SPLIT` (gr_down K-split) — **default OFF** (opt-in `=1`).
+  54.16 + 5.60 µs vs the base 47.99 µs → +133.1 ms. The base already runs a single wave
+  (41 blocks < 90 SMs); K-splitting to 164 blocks adds register pressure (95 vs 74 regs),
+  a `part`-scratch round-trip and a separate reduce launch, without shortening the
+  critical path.
+- **REVERT E3** `STRATA_ROUTE_SORT` (bitonic-sort top-10) — **default OFF** (opt-in `=1`).
+  15.90 vs 9.51 µs → +100.0 ms; the 16-element bitonic sort is 1.68× the iterative-argmax
+  `route` scan in the same single-block single-warp kernel.
+- Net all-on was +163.3 ms ≈ 3.2 % (matches the raw +3.5 %). The MTP/draft kernels and all
+  memcpy are byte-identical across captures, so the regression is 100 % the E1/E2/E3 kernels.
+- **E2 end-to-end (GPU0, 256 tok, 12 tight interleaved pairs, `drop_caches` between):**
+  baseline 5211 ms (49.13 tok/s) vs E2 5194.9 ms (49.28 tok/s) → **−16.2 ms (−0.31 %),
+  +0.15 tok/s**, E2 faster in 9/12 pairs; outlier-trimmed (2 MCE/scheduling hiccups)
+  −58.7 ms (−1.13 %), consistent with the kernel-level −69.8 ms. Per-run noise (±90 ms)
+  is as large as the effect, so read the e2e as "small but directionally consistent, never
+  net-hurting"; the unambiguous win is the norm kernel.
+- **Correctness:** 32/32 golden every run; 256/256 byte-identical deterministic re-runs
+  (E2 output byte-identical to the all-off baseline); 0 CUDA errors / no hangs; ctest 20/22
+  (2 pre-existing environmental failures). **VRAM/RAM:** peak VRAM 18,900 MiB identical for
+  baseline and E2 (E1 scratch no longer reserved when E1 is off); host RAM stable (~96 GiB
+  available, ~29 GiB PLE page cache).
+
+Raw data: `Logs/benchmarks/s17f-{base,e2}-{1..12}.{log,json}` (final E2 A/B),
+`Logs/benchmarks/s17x-*.{log,json}` (8-arm all-knob matrix), `Logs/benchmarks/s17c-*`
+(correctness), `Logs/gpu/s17x-*.nsys-rep/.sqlite` (kernel captures). Full write-up:
+`Docs/v100-stage1.7-final.md` (state/checkpoint: `Docs/v100-stage1.7-state.md`).

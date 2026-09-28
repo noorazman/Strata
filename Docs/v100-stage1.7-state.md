@@ -301,3 +301,142 @@ a separate-mode flag; bench = 256-token decode ×3 interleaved + 32/32 golden +
 - No CUDA errors / hangs / races; ctest 20/22 (2 pre-existing environmental).
 - Cross-card note: GPU4 16 GB diverges from GPU0 on ~96–108 of 256 tokens
   pre-existing (different resident set) — compare GPU4-vs-GPU4, not vs GPU0.
+
+## 10. E1 gr_down K-split — bug found, fixed, verified (2026-09-28)
+
+The E1/E2/E3 experiments were implemented (uncommitted; `fused_gr.cu`,
+`native_router.cu`, `layer/mtp/verify.{cpp,hpp}`). E1 (split-K down) was
+**non-deterministic** and produced wrong `lo` for down-rows 0–3: the all-on
+(E1+E2+E3) e2e bench diverged from the golden at token 15 and two identical
+all-on runs were NOT byte-identical, while each single-experiment arm was clean.
+
+**Root cause (the split-K `part` scratch layout):** `part` is `[row][token][lane]`
+over 324 rows — rows 0..319 = the 320 down rows, rows 320..323 = the 4 inject rows.
+Both `gr_down_multi_split_kernel` and `gr_down_multi_reduce_kernel` computed the
+inject block's row as `row = inject_block ? warp : block*WARPS+warp` (i.e. `warp`,
+0..7) instead of `320 + warp`. So the inject block wrote its partials to `part[0..3]`,
+**colliding with down-rows 0–3** (which down-block b=0 also writes) → a data race.
+Down-rows 4–7 (inject warps 4–7 inactive) and all other rows were unaffected —
+exactly the observed "only rows 0–3 wrong" pattern. The legacy single-kernel down
+does the warp-sum in-kernel (no `part` buffer), so it was never affected. The
+corruption cascaded into the router (pre-fix E1-on runs showed ~1.09 experts
+routed/layer vs ~4.9 normal and 27.2 ms/token vs ~20 — the ~34 tok/s was a
+*consequence* of the bug, not the split kernel's true cost).
+
+**Fix (`fused_gr.cu`, both kernels): separate the weight-matrix row from the
+part-buffer row.** split: `down_row=b*WARPS+warp; weight_row=inject_block?warp:down_row;
+part_row=inject_block?DOWN_BLOCKS*WARPS+warp:down_row` (weight load uses
+`weight_row`; part write uses `part_row`). reduce: `down_row=blockIdx.x*WARPS+warp;
+part_row=inject_block?DOWN_BLOCKS*WARPS+warp:down_row` (part read uses `part_row`;
+epilogue writes `inject_out[warp]` and `lo[down_row]`). `DOWN_BLOCKS*WARPS`=320.
+
+**Verified bitwise:** (1) dedicated A/B unit harness (`fused_gr.cu` compiled
+directly): all 4 combos of STRATA_GR_DOWN_SPLIT × STRATA_GR_NORM_SPLIT are
+**byte-identical** across T=1..8 (full `lo`+`inject` per token); isolated
+`part`-vs-host-ref went 128/256 mismatched → 0/256. (2) ctest 20/22 (same 2
+pre-existing environmental: `ple_parity` missing Q2_0 shard, `platform_memory_test`
+mlock ulimit). (3) e2e 6-arm isolation matrix (GPU0, 256 tok): base/e1/e2/e3/
+all-on-1/all-on-2 → **all 256-token sequences byte-identical** (md5
+`c1517d02473fbc06b5cf415ea1f8be63`), spec 145/210 (0.690) on every arm.
+
+**Performance (clean 3× medians, GPU0, 256 tok, drop_caches between runs):**
+base (all off) **5233.1 ms = 48.9 tok/s**; all-on (E1+E2+E3) **5413.8 ms = 47.3
+tok/s** (~3% slower, consistent across 3 runs, inside the documented ±1–2 tok/s
+MCE/scheduling drift band). Note: pre-fix `s17e1-on` numbers (30–37 tok/s) are
+contaminated by the bug and are NOT the split kernel's true cost.
+
+**Per-arm clean 3× medians (same protocol, `s17p-e{1,2,3}-{1,2,3}`):**
+
+| arm | median decode ms | tok/s | vs base |
+|---|---:|---:|---:|
+| base (all off) | 5233.1 | 48.92 | — |
+| E1 down-split | 5143.8 | 49.77 | **+1.7 %** |
+| E2 norm-split | 5134.1 | 49.86 | **+1.9 %** |
+| E3 route-sort | 5269.5 | 48.58 | −0.7 % |
+| all-on E1+E2+E3 | 5413.8 | 47.29 | **−3.5 %** |
+
+Reading: E1 and E2 are each a small e2e win (within the ±1–2 tok/s drift band);
+E3 is neutral; but **all three together are ~3.5 % slower than base — a negative
+interaction larger than the sum of the individual deltas** (each all-on run is
+slower than every single-arm run). Candidate causes to investigate next: extra
+kernel launches (E1/E2 each add a reduce kernel → more launch/latency in the
+93.8 %-busy decode), the extra `part`+norm scratch raising VRAM/pressure, or MCE
+drift concentrated in the all-on window. Not yet confirmed as a real interaction
+vs noise — needs more interleaved all-on runs (and an E1+E2-only arm) to pin down.
+
+## 11. All-on regression — root-caused (2026-09-28)
+
+**Question:** is the E1+E2 interaction a real regression, and what is the mechanism
+behind the ~3.5 % all-on slowdown?
+
+### 11.1 8-arm interleaved benchmark (GPU0, 256 tok, 30 runs, 3 full cycles + 2 core cycles)
+Arms: base / e1 / e2 / e3 / e12 / e13 / e23 / allon, round-robin interleaved with
+`drop_caches` between runs. **Correctness on every run: all 30 produced the identical
+256-token golden sequence (md5 `c1517d02473fbc06b5cf415ea1f8be63`), spec 145/210,
+0 CUDA errors.** Box drift between cycles was large (base 5034.7→5265.3 ms across
+cycles, sd 95 ms), so cycle-paired (arm−base, same cycle) is the right statistic:
+
+| arm | cycle-paired Δ vs base (ms, mean±sd) | n | sign |
+|---|---:|---:|---|
+| e1 | +192 ± 121 | 3 | 3/3 slower |
+| e2 | +34 ± 88 | 3 | 2/3 slower |
+| e3 | +241 ± 74 | 3 | 3/3 slower |
+| **e12 (E1+E2)** | **+44 ± 120** | 5 | 4/5 slower (small) |
+| e13 | +186 ± 157 | 3 | 2/3 slower |
+| e23 | +107 ± 68 | 3 | 3/3 slower |
+| **allon** | **+123 ± 121** | 4 | 3/4 slower |
+
+e2e reading: **E1+E2 alone (e12) is a small, real but modest regression (~+1 %)** —
+it does NOT reproduce the 3.5 %. The 3.5 % all-on penalty needs E3 on top.
+
+### 11.2 nsys per-kernel mechanism (base / e12 / allon, `--cuda-graph-trace=node`)
+The `find_decode_window` heuristic placed the base window start after a batch of
+constant MTP/draft work, so the decode-window *span* (6.26 s base vs 8.04 s e12) is
+partly a capture artifact. Whole-capture counts prove those kernels are constant:
+`magma_sgemmEx` 432, `dequant_gu` 4073, `dequant_flat` 4156, `cutlass` 5060,
+`gemv2T` 3386, `splitKreduce` 2500, and all memcpy (H2D 16749 / 31.6 GB) are
+**identical across the three captures**. The only kernels that differ are the
+E1/E2/E3 kernels themselves — the regression is 100 % attributable to them:
+
+| kernel (per call) | base | e12/allon | Δ (256 tok) |
+|---|---:|---:|---:|
+| gr_down_multi (41 blk, r=74) | 47.99 µs | — | — |
+| gr_down_multi_split (164 blk, r=95) + reduce (41 blk, r=25) | — | 54.16 + 5.60 µs | **E1: +133.1 ms** |
+| gr_norm_multi (1 blk/tok) | 14.04 µs | — | — |
+| gr_norm_multi_split (4 blk/tok) | — | 7.86 µs | **E2: −69.8 ms (win)** |
+| route (single-warp) | 9.51 µs | — | — |
+| route_sort (single-warp) | — | 15.90 µs | **E3: +100.0 ms** |
+
+**Net all-on = +133.1 − 69.8 + 100.0 = +163.3 ms ≈ 3.2 %** — matches the raw-bench
++3.5 % all-on regression. `part` scratch traffic is small (~1.3 GB total, ~100 MB/s,
+L2-resident) — not the dominant cost.
+
+### 11.3 Mechanisms (confirmed)
+- **E1 (gr_down K-split) is the largest cost (+133 ms).** Base gr_down already runs a
+  single wave (41 blocks < 90 SMs). K-splitting to 164 blocks does NOT shorten the
+  critical path (the down projection is not K-parallelism-bound); it adds register
+  pressure (95 vs 74 regs → 2 blocks/SM occupancy), a `part`-scratch round-trip
+  (each K-sub-block writes partials to global, reduce reads back), and a separate
+  reduce kernel launch. Net: split 54.16 µs + reduce 5.60 µs = 59.76 µs vs 47.99 µs.
+- **E3 (route_sort) is the second cost (+100 ms).** The bitonic-sort top-10 selection
+  is 1.68× slower than the iterative argmax `route` scan, in the same single-block
+  single-warp kernel (9.51 → 15.90 µs).
+- **E2 (gr_norm split) is a genuine win (−70 ms).** The norm was latency-bound at
+  1 block/token; splitting to 4 blocks/token (one per HC stream) halves the time
+  (14.04 → 7.86 µs) with no scratch round-trip.
+
+### 11.4 Verdict + recommendation (NOT yet committed)
+- **The "E1+E2 interaction" is a real but small regression (~+1 %, +44–63 ms); it is
+  not the 3.5 %.** It is additive, not synergistic: E1's +133 ms cost is mostly
+  offset by E2's −70 ms win.
+- **The 3.5 % all-on regression = E1 (+133 ms) + E3 (+100 ms) − E2 (−70 ms).**
+- **Recommendation: keep E2 (norm-split) only; revert E1 (gr_down K-split) and E3
+  (route_sort).** Expected: ~+1.4 % e2e speedup, no regression.
+- Files touched by the experiments (all uncommitted, working tree):
+  `src/kernels/cuda/fused_gr.cu` (E1 split+reduce, E2 norm-split),
+  `src/kernels/cuda/native_router.cu` (E3 route_sort),
+  `include/strata/kernels/fused_gr.hpp`, `src/core/{layer,mtp,verify}.cpp` + hpp.
+  Env gates (all currently default-ON): `STRATA_GR_DOWN_SPLIT`, `STRATA_GR_NORM_SPLIT`,
+  `STRATA_ROUTE_SORT`. To implement "E2 only": default E1+E3 to off (or flip the
+  `getenv` opt-out logic for those two).
+- Working tree left uncommitted; `strata.service` left stopped. No new commits.

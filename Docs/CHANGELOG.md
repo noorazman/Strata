@@ -2,6 +2,54 @@
 
 Important historical changes and decisions. No raw logs.
 
+## 2026 — V100 Stage 1.7 (branch `stage1.3-expert-pool-sync`, GPU0 only)
+
+GPU kernel experiments: profiled the decode GPU kernel breakdown, ran three env-gated
+kernels, root-caused the all-on regression, and finalized the keepers. Production target
+is the 32 GB V100 (GPU0) only (16 GB / GPU4 not validated this stage).
+
+- **Profiled the decode GPU kernels (nsys 2024.6.2, `--cuda-graph-trace=node`).** The
+  MTP/draft kernels and all memcpy are byte-identical across the base/e12/allon
+  captures, so the all-on regression (~3.5 %) is 100 % attributable to the three
+  experiment kernels themselves. Per-kernel: `gr_down_multi` 47.99 µs (base) vs
+  `gr_down_multi_split`+`gr_down_multi_reduce` 54.16+5.60 µs (**E1 +133.1 ms**);
+  `gr_norm_multi` 14.04 µs (base) vs `gr_norm_multi_split` 7.86 µs (**E2 −69.8 ms**);
+  `route` 9.51 µs (base) vs `route_sort` 15.90 µs (**E3 +100.0 ms**). Net all-on
+  +163.3 ms ≈ 3.2 %, matching the raw-bench +3.5 %.
+- **KEEP E2 `STRATA_GR_NORM_SPLIT` (per-stream gr_norm split), now the default (ON).**
+  The norm was latency-bound at 1 block/token; splitting to 4 blocks/token (one per HC
+  stream) halves the kernel time (−44 %) with no scratch round-trip. Bitwise-identical
+  to the single-block norm; adds no VRAM. `STRATA_GR_NORM_SPLIT=0` keeps the single block.
+  End-to-end on GPU0 (256 tok, 12 tight interleaved pairs, `drop_caches` between):
+  baseline 5211 ms (49.13 tok/s) vs E2 5194.9 ms (49.28 tok/s) = **−16.2 ms (−0.31 %),
+  +0.15 tok/s**, E2 faster in 9/12 pairs; outlier-trimmed −58.7 ms (−1.13 %), consistent
+  with the kernel-level −69.8 ms.
+- **REVERT E1 `STRATA_GR_DOWN_SPLIT` (gr_down K-split) to default OFF (opt-in `=1`).**
+  The base `gr_down_multi` already runs a single wave (41 blocks < 90 SMs); K-splitting
+  to 164 blocks does not shorten the critical path but adds register pressure (95 vs 74
+  regs → 2 blocks/SM), a `part`-scratch global round-trip, and a separate reduce-kernel
+  launch. Its 320 KiB `grdown_part_` scratch (per MTP + verify pool) is now reserved
+  only when E1 is enabled (`fused_gr_down_split_enabled()`), so the production
+  (E1-off) footprint no longer carries the unused scratch. (A prior E1 bug — the
+  inject-block part-row collision — was found and fixed earlier and is bitwise-verified.)
+- **REVERT E3 `STRATA_ROUTE_SORT` (bitonic-sort top-10) to default OFF (opt-in `=1`).**
+  The 16-element bitonic sort is 1.68× slower than the iterative-argmax `route` scan
+  (15.90 vs 9.51 µs) inside the same single-block single-warp kernel.
+- **E4 (slow attention / selection A/B) plumbing** is in place and opt-in
+  (`--no-fast-attn` / `--no-fast-select`): the verify window reproduces the fast OR the
+  slow (gather + one-block-per-head / cell top-k) QSA arithmetic, so attention can be
+  A/B'd inside the window. `layer_verify_compatible` no longer gates on
+  `g_fast_attn`/`g_fast_select`; the short flash-attention adapter still does.
+- **Correctness:** 32/32 golden every run (golden 256-token md5
+  `c1517d02473fbc06b5cf415ea1f8be63`); 256/256 byte-identical deterministic re-runs (E2
+  output byte-identical to the all-off baseline); 0 CUDA errors / no hangs; ctest 20/22
+  (the 2 failures pre-existing/environmental: `ple_parity` missing Q2_0 shard,
+  `platform_memory_test` mlock ulimit). **VRAM/RAM:** peak VRAM 18,900 MiB identical for
+  baseline and E2; host RAM stable.
+
+Doc: `Docs/v100-stage1.7-final.md` (state/checkpoint `Docs/v100-stage1.7-state.md`).
+Raw data: `Logs/benchmarks/s17{f,x,c}-*` and `Logs/gpu/s17x-*.nsys-rep/.sqlite`.
+
 ## 2026 — V100 Stage 1.6 (branch `stage1.3-expert-pool-sync`, on top of the 1.5 commit `95a338e`)
 
 CPU pool scheduling optimization (the seven 1.6 candidates: affinity/governor, SMT/core placement, keep-frequency-high, pool scheduling/drain, park-threshold re-test, the "l1/g0" ring-spin tail, cross-layer pipelining). Profile-first, one-change-at-a-time; kept only what measures end-to-end. Net e2e **48.7 → 50.0–50.1 tok/s (+~3 %)**.

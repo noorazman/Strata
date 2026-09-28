@@ -1,0 +1,39 @@
+{
+ "workers": 24,
+ "mtp_mib": 808.0,
+ "streamed_experts": 2271,
+ "dma_experts": 2271,
+ "stream_host_ms": 13.5,
+ "resident_experts": 1802,
+ "prefill_ple_ms": 96.9,
+ "label": "s17e4-nofastattn-5",
+ "gpu": 0,
+ "max_new": 256,
+ "max_context": 8192,
+ "kv": "fp16",
+ "n_prompt": 29,
+ "wall_s": 138.8,
+ "engine_rc": 1,
+ "peak_vram_mib": 18712,
+ "peak_gpu_util": 100,
+ "mem_before": {
+  "mem_total_gib": 125.77683639526367,
+  "mem_available_gib": 96.66097640991211,
+  "cached_gib": 18676496.133304596
+ },
+ "mem_after": {
+  "mem_total_gib": 125.77683639526367,
+  "mem_available_gib": 96.46662902832031,
+  "cached_gib": 48383428.27553558
+ },
+ "command_tail": "--expert-cache auto --prefill 2048 --spec 4 --spec-min-p 0.5 --pool-workers 24 --mtp mtp/rt --max-context 8192 --kv fp16 --max-new 256 --tokens 9419,11,821,803,369,7967,13,353,1044,264,11952,5617,303,220,17,15,17,21,13,10875,353,668,3184,488,883,821,1118,1834,13 --stats --no-fast-attn",
+ "cpu": {
+  "cpu_total_mean_pct": 6.3,
+  "cpu_total_peak_pct": 15.2,
+  "cpu_core_mean_pct": 6.3,
+  "cpu_core_peak_pct": 100.0,
+  "cores_mean_ge50pct": [
+   "26:100%"
+  ]
+ }
+}

@@ -1,12 +1,12 @@
 {
  "decode_tokens": 256,
- "decode_ms": 5118.1,
- "decode_tps": 50.02,
+ "decode_ms": 5223.0,
+ "decode_tps": 49.01,
  "prefill_tokens": 28,
- "prefill_ms": 1289.9,
- "prefill_tps": 21.71,
- "ttft_ms": 1416.8,
- "wall_ms_tok": 19.993,
+ "prefill_ms": 4061.0,
+ "prefill_tps": 6.89,
+ "ttft_ms": 5048.9,
+ "wall_ms_tok": 20.402,
  "output_tokens": [
   271,
   248068,
@@ -269,13 +269,13 @@
  "mtp_mib": 808.0,
  "streamed_experts": 2271,
  "dma_experts": 2271,
- "stream_host_ms": 12.3,
+ "stream_host_ms": 14.3,
  "resident_experts": 1802,
- "prefill_ple_ms": 15.8,
+ "prefill_ple_ms": 82.1,
  "ple_ram_rows": 320001536,
  "ple_ram_gib": 26.82,
- "ple_ram_preload_s": 24.09,
- "ple_ram_preload_gibs": 1.11,
+ "ple_ram_preload_s": 20.99,
+ "ple_ram_preload_gibs": 1.28,
  "ple_ram_served_rows": 5584,
  "ple_ram_served_mb": 0.5,
  "spec_rounds": 111,
@@ -284,11 +284,11 @@
  "spec_drafts": 210,
  "spec_accept": 0.69,
  "spec_tpr": 2.31,
- "mtp_draft_ms_round": 1.933,
+ "mtp_draft_ms_round": 1.926,
  "mtp_rounds": 110,
- "mtp_prompt_ms": 10.4,
+ "mtp_prompt_ms": 97.7,
  "mtp_vram_mib": 876,
- "pool_ms_tok": 12.795,
+ "pool_ms_tok": 13.321,
  "pool_positions": 111,
  "pool_phases_ms_tok": {
   "wait_park": 0.0,
@@ -310,26 +310,28 @@
  "max_context": 8192,
  "kv": "fp16",
  "n_prompt": 29,
- "wall_s": 115.0,
+ "wall_s": 122.6,
  "engine_rc": 0,
- "peak_vram_mib": 18896,
+ "peak_vram_mib": 18900,
  "peak_gpu_util": 100,
  "mem_before": {
   "mem_total_gib": 125.77683639526367,
-  "mem_available_gib": 96.22009658813477,
-  "cached_gib": 47989236.275447845
+  "mem_available_gib": 96.51007461547852,
+  "cached_gib": 18553140.133907318
  },
  "mem_after": {
   "mem_total_gib": 125.77683639526367,
-  "mem_available_gib": 96.2868423461914,
-  "cached_gib": 48080800.2755394
+  "mem_available_gib": 96.25993347167969,
+  "cached_gib": 48182948.27536774
  },
  "command_tail": "--expert-cache auto --prefill 2048 --spec 4 --spec-min-p 0.5 --pool-workers 24 --mtp mtp/rt --max-context 8192 --kv fp16 --max-new 256 --tokens 9419,11,821,803,369,7967,13,353,1044,264,11952,5617,303,220,17,15,17,21,13,10875,353,668,3184,488,883,821,1118,1834,13 --stats",
  "cpu": {
-  "cpu_total_mean_pct": 7.1,
-  "cpu_total_peak_pct": 46.5,
-  "cpu_core_mean_pct": 7.1,
+  "cpu_total_mean_pct": 8.1,
+  "cpu_total_peak_pct": 48.4,
+  "cpu_core_mean_pct": 8.1,
   "cpu_core_peak_pct": 100.0,
-  "cores_mean_ge50pct": []
+  "cores_mean_ge50pct": [
+   "55:90%"
+  ]
  }
 }
