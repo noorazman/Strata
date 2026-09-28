@@ -2,6 +2,80 @@
 
 Important historical changes and decisions. No raw logs.
 
+## 2026 — V100 Stage 1.9 (branch `stage1.3-expert-pool-sync`, GPU0 only)
+
+`wait_flag_ge` A/B/C dependency analysis (profile-only stage, no engine changes; binary
+`90afb6c`). Question: understand the wait bottleneck before changing any synchronization
+code — why 3 waits, which are necessary, what each contributes, can they be merged/
+overlapped/moved/eliminated, and is this the Stage 1.6 flag-C visibility issue.
+**Verdict: the 3-wait A/B/C protocol is the original design (first commit `f2a08d4`) and all
+three waits are load-bearing; the dominant cost is the round-head flag-A visibility lag
+(63 % of all wait time) — the Stage 1.6 boundary mechanism landing on the A slot.**
+
+- **Classifier + captures (`bench/v100/s19.sh`, `bench/v100/s19_trace.py`).** nsys
+  `--cuda-graph-trace=node` 256-tok fp16/8192 (s19-base) and 256-tok int8/32768 (s19-int8)
+  on the current binary + the same-workload old-binary capture (s17x, Stage 1.6 code) +
+  the 64-tok F1 source (s18nsys-base). The classifier anchors wait-A on the following
+  `copy_i32_from_mapped_kernel` (exactly 1/3 of waits in every capture) and walks the
+  fixed A→B→C cycle inside the 48-dispatch round; it reproduces the known s17x and
+  s18/F1 totals to the digit (15,984 waits; 503.5 ms = 7,868 µs/tok). Staging streams
+  identified by stream id: verify staging = 17 (1,800 copies / 3.11 GB = 0.34
+  distinct experts/layer, identical old vs new), adaptive-tier refill = 19 (exactly
+  2,503 copies = the engine's swap count).
+- **Q1/Q2 (why 3, which are necessary).** Both binaries issue exactly 3 waits/dispatch —
+  F1's "1→3" was the ring count (5,328) vs the wait count (15,984); per-dispatch wait is
+  308.5 µs (old) → 313.3 µs (new), +1.6 % = no binary regression. F1's 420 µs was the
+  64-tok cold window (539.9/449.6/368.3 ms cold stalls + a 20.2 ms round-0 C outlier +
+  25-round statistics). A is always necessary (plan gate; publish sfence max 22 µs makes
+  it a valid gate for the WB plan data); B is necessary when ≥1 blob staged (≈39/48
+  dispatches; 0-blob dispatches pay a ~3–5 µs spin tax ≈ 0.3 % e2e); C is necessary
+  whenever the CPU share is non-empty (82.8 % cache hits, 3.63 distinct CPU experts/layer
+  → essentially always).
+- **Q3 (time each contributes).** 256-tok fp16 (111 rounds): total wait 1,672.3 ms =
+  6,532 µs/tok = 29.9 % of the main stream. A 1,103.7 ms (66.0 %): round-head 1,058.4 ms
+  = 9.54 ms/round (max 14.6) vs mid-round 8.7 µs mean. B 196.7 ms (11.8 %): head 0.50
+  ms/round, mid 27.0 µs, 10 % DMA-tied. C 371.9 ms (22.2 %): head 0.30 ms/round, mid
+  64.9 µs. int8/32768: 1,754.8 ms = 6,855 µs/tok (A 63.3 / B 22.2 / C 14.5 %). >1 ms
+  cohort: 150 waits = 1,157.6 ms = 69.2 % of all wait time; 125/150 at the round head;
+  111 of those are flag A (one per round). Host side of A: doorbell→publish mean 75 µs,
+  max 376 µs, 0 > 1 ms.
+- **Q4 (merge/overlap/move/eliminate).** Keep 3 waits. Merging B+C turns `max(B+X,C)`
+  into `max(B,C)+X` — the current structure overlaps the PCIe-grouped kernels with the
+  pool tail and wins in the common C ≥ B case (measured mid C 65 µs ≥ B 27 µs). waitB on
+  a side stream is wall-neutral (the PCIe group is DMA-gated either way). Mid-round A
+  (8.7 µs) is at the floor (the plan cannot be known before the `moe_route`→doorbell).
+  Only removable small item: the ~0.1 ms/round zero-blob waitB tax (needs conditional
+  graph nodes).
+- **Q5 (relation to Stage 1.6).** Same mechanism, different slot: one ~9–14.6 ms spin per
+  round at dispatch 0 — the host publishes A ≤ 376 µs after the doorbell (the store is in
+  DRAM on return) but the GPU's read of the mapped line stays stale ~9–14 ms at every
+  window boundary. The 1.6-era captures show the identical shape in the l0 flag-C slot
+  (25,564 poll iters); the slot moved because the A wait now straddles the boundary
+  (waitA starts at doorbell+~15 µs, the A store lands at +80 µs). Host corroboration:
+  l0 ring-wait 0.000 ms/round, the slow host-side spin is the l1/g0 shadow (7.9–8.2 ms =
+  the GPU's `post(0)`+`pre(1)`), round-end host path 2.90 ms/round (run→commit 0.89 +
+  commit→draft 1.98 + draft→run 0.03). The round-0 C outlier (19.8–29.0 ms across
+  captures) is the separate first-round cold-start effect.
+- **Root cause (confirmed) + theoretical opportunity.** (1) the 3-flag structure is
+  correct, per-dispatch spin ~310 µs, no regression; (2) 63 % of all wait time is the
+  round-head flag-A visibility lag (1,058.4 ms); (3) the rest is mid-round C pool tail
+  (338.8 ms) + B copy-engine queue state (141.1 ms). The lag is on the critical path with
+  the host already ready: round-head A → mid-level removes 2,398 µs/tok of wait → e2e
+  50.8 → ~64 tok/s (+26 % ceiling; ~+30 % if head B/C normalize). 3× the entire QSA
+  attention mechanism (1,317 µs/tok, Stage 1.8).
+- **Recommended next experiment (proposed, NOT implemented):** `STRATA_WAIT_FENCE=1` —
+  env-gated periodic `__threadfence_system()` every ~1024 poll iterations inside
+  `wait_flag_ge_kernel` (today it fences only after the loop exits); direct test of the
+  stale-mapped-line hypothesis; arm = nsys round-head A distribution + e2e A/B with
+  golden/determinism gates. Fallbacks: pre-warm flag-line read at the window head, then
+  MTP-draft reordering.
+- **Correctness:** 32-tok 32/32 golden (`cf577e…`), 256-tok ×2 byte-identical = golden
+  `c1517d02473fbc06b5cf415ea1f8be63` (50.77/50.76 tok/s, 111 rounds), hostdiag arm 50.76
+  tok/s with all four host diagnostics on (wait for rings 26.04 / pool 12.57 / commit
+  0.86 ms/round; expert-cache 82.8 % hits), all runs rc=0, no CUDA errors/hangs.
+  `strata.service` stopped for the campaign and left stopped (stage instruction).
+  Doc: `Docs/v100-stage1.9-final.md`.
+
 ## 2026 — V100 Stage 1.8 (branch `stage1.3-expert-pool-sync`, GPU0 only)
 
 QSA attention-path analysis (profile-only stage, no engine changes; binary `0fea54d`).
