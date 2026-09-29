@@ -2,6 +2,78 @@
 
 Important historical changes and decisions. No raw logs.
 
+## 2026 — V100 Stage 1.11 (branch `stage1.3-expert-pool-sync`, GPU0 only)
+
+Prefill / TTFT optimization: profile → identify the largest real bottleneck → make ONE
+isolated opt-in change at a time → benchmark → correctness-gate. **Verdict: the 16K prefill
+wall (36.6 s = 2.232 ms/tok) is a saturated SM+DMA pipeline (~89 % GPU busy) — MoE expert
+streaming 54.9 % (171.5 GB H2D at 10.57 GB/s ≈ 80 % of PCIe3, the copy engine's active-feed
+ceiling), dequant 25.8 %, expert GEMM 12.8 %. Three isolated opt-in candidates were measured;
+all are net-neutral on TTFT (≤ 0.5 s on a 40 s wall at 16 K), each correctness-clean; per the
+stage stop rule, all stay opt-in (default OFF) and the 32K production config is unchanged.**
+
+- **Profiling (nsys 16K, `s111_breakdown.py` + raw memcpy-table analysis).** DMA gap shape:
+  8 × ~270 ms CE-idle windows at chunk boundaries — each SM-busy (18.5 k draft kernels / 249 ms,
+  the MTP K/V build); 371 × 1–100 ms (mean 36 ms) section-boundary gaps (per-layer routing
+  round-trip); **zero in-section gaps** (8-slot staging ring, 7-deep lookahead fully feeds the
+  CE). Active H2D rate 10.57 GB/s per CE (a second CE measured the same rate in the same trace).
+  ncu SOL campaign (`s111ncu2.sh`, fixed for application-replay: fixed `--expert-cache 9000` +
+  idle-GPU precondition — `auto` sizing drifts between replay passes — and `--kill 1`, since the
+  app deadlocks in the ncu-intercepted MTP decode when it runs past the profiled launches):
+  11 kernel profiles complete. Roofline: the whole MoE+QSA+GDN path is **latency-bound**
+  (dequant 9 % / expert GEMM 11 % / attention ~10 % / GDN 23 % SM, plus ~150 K ~10 µs
+  `dequant_flat` + 133 K ~4 µs `swiglu` elementwise launches); the large dense GEMMs are
+  **efficient** (cutlass 128×128 SM 76–79 %, volta 256×128 SM 81 % — near the roofline); the
+  PLE projection is the only hard **DRAM-bound** kernel (85 % of DRAM peak). The bottleneck
+  remains the H2D feed rate + the small-kernel launch storm, not any single dense GEMM.
+- **E3 `STRATA_MTP_OVERLAP=1`** (`src/core/mtp.cpp`, `include/strata/core/mtp.hpp`,
+  `src/program/generate.cpp`): replace the legacy per-sub-chunk MTP K/V loop (512 × 4-token
+  sub-chunks, `cudaStreamSynchronize` after each) with ONE chunk-sized CUDA graph, captured
+  synchronously at `bind()` (quiescent; ~290–355 ms one-time) and launched unsynced per
+  boundary, so the ~170 ms of drafter work overlaps the next chunk's main-model prefill.
+  Bring-up root-caused two bugs via gdb: (1) background-thread capture race — while any stream
+  capture is active, a kernel launch on another stream fails with
+  `cudaErrorStreamCaptureUnsupported` (900); `iq_kernels.cu check()` then `std::exit(1)`d on the
+  main thread while the capture thread sat mid-`cudaLaunchKernel` → glibc mutex assert →
+  SIGABRT; fixed by main-thread capture at the quiescent bind (+ main-thread lazy exact-n
+  captures, ~15 ms); (2) R-rows D2D race — the unsynced D2D of the chunk's R rows (read by the
+  drafter) ran on the drafter stream while the next chunk's `gr_broadcast` rewrites the same
+  rows on the main stream (legacy was masked by its per-sub-chunk sync); fixed by running the
+  D2D on the main-model stream (in-stream order: before the rewrite) with the graph waiting on
+  an event. A/B (r1/r2): 4K 14.16/13.25 vs 13.99/13.22 s; 16K 40.73/39.98 vs 40.40/39.74 s;
+  32K 76.74/76.27 vs 76.74/76.50 s — **neutral**: the draft work is real SM work; overlapping it
+  on an ~89 %-utilized pipeline re-assigns timing, not total.
+- **E4 `STRATA_MOE_ASYNC_IDS=1`** (`src/prefill/prefill.cpp`): the per-MoE-layer 80 KB
+  routing-ids D2H went to pageable memory followed by a full `cudaStreamSynchronize(m.cs)`
+  (~2.6 ms × 288 at 16 K; 1,008 ms host blocking in the breakdown). Now: pinned
+  `ids_host/slot_host/src_host` (`cudaHostRegister`), the D2H is issued right after `route()`
+  (before the shared-expert GEMMs that don't need the ids) and the host waits only for that
+  copy via `ids_ev`. A/B 16K: 40.48/40.23 s — **neutral**: the trace shows the GPU is busy with
+  queued work during most of the blocking (only ~136 ms pure D2H-idle — the recoverable
+  ceiling, below noise).
+- **E7 `STRATA_TWO_STREAM_DMA=1`** (`src/prefill/prefill.cpp`): the expert staging ring's slots
+  alternate across a second copy stream (`copy2`), so one CE waiting on a slot's
+  GEMM-freed event doesn't idle the other. A/B 16K: 40.60/39.97 s — **neutral**: in-section
+  gaps are already zero (the 7-deep lookahead feeds the single CE fully) and the active rate is
+  the per-CE TLP efficiency (~10 GB/s at ~2 MB transfers; the second CE matches it).
+- **Combined** (all three on): 40.85/40.10 s @16K, 76.52/76.33 s @32K — neutral.
+- **Correctness (every arm; fresh-engine gates, int8 KV, production flags):** 32/32
+  golden-prefix MATCH; 256/256 byte-identical (md5 `cdb7f7d056f339ba704d3bb9620a1dec` — the
+  Stage 1.8/1.10 int8 reference); decode 48.97–51.9 tok/s (target 49–50, within gate noise);
+  cold-r1 serve output bit-identical to the OFF baseline (16K `6041c5…`, 32K `1fbe57…`); all
+  runs rc=0, no CUDA errors/hangs. INT8 KV / QSA attention mechanism / production context /
+  Stage 1.9 sync untouched (E4/E7 reorder enqueues + stream assignment only; E3 only the MTP
+  drafter). All opt-in, default OFF.
+- **Deferred (measured rationale):** E6 QSA `attn_batch` 32→256 (FP32-compute-bound kernel —
+  expected ≤ 0.2–0.5 s, below the demonstrated ~±0.5 s noise floor); E2 dequant side-stream
+  (same SM-contention argument as E3). Real remaining levers: byte-reduction (more residency is
+  VRAM-bound at ~9 K slots on this card; batched/larger DMA spans untested) and kernel-level
+  dequant+GEMM fusion.
+- **Tooling:** `bench/v100/s111e3.sh`, `s111e4.sh`, `s111e7.sh` (per-experiment gate + ctx A/B),
+  `s111_breakdown.py` (nsys 10-category parser), `s111ncu2.sh` (11-profile SOL campaign),
+  `s110.sh` gained `EXTRA_ENV` passthrough for opt-in flags. Doc:
+  `Docs/v100-stage1.11-final.md`.
+
 ## 2026 — V100 Stage 1.10 (branch `stage1.3-expert-pool-sync`, GPU0 only)
 
 Prefill / TTFT / long-context investigation (measurement stage; opt-in instrumentation

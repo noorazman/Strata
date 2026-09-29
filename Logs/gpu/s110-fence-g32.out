@@ -1,0 +1,7 @@
+[bench] s110-fence-g32: gpu0 free 32764 MiB; ok
+[bench] s110-fence-g32: rc=0 wall=125.3s decode=40.98 tok/s (32 tok / 780.9 ms) prefill=15.18 tok/s TTFT=2224.8 ms peakVRAM=18900 MiB cpuMean=3.6% peakGPU=100%
+[bench]   cache hits 12000/17220 = 69.7% (admitted 0, refused 5220, 100.0% full)
+[bench]   spec: 12 rounds x 4, accepted 20/25 (0.8), 2.67 tok/round; mtp draft 2.103 ms/round
+[bench]   PLE RAM: 26.82 GiB resident, preloaded in 24.32 s (1.1 GiB/s); served 1040 rows (0.1 MB) from RAM
+[bench]   pool 23.43 ms/tok (drain 0.0, re-park 0.0, wait 0.0)
+[bench]   output: 271 248068 198 760 1156 369 30869 5402 430 328 23202 1288 264 11952 5617 303 ... (32 tokens)

@@ -1063,6 +1063,15 @@ int main(int argc, char** argv) {
         }
         if (!o.mtp.empty()) mtp.set_prompt_len((int64_t) o.tokens.size());
         if (!o.mtp.empty() && !mtp.load(o.mtp, g, ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
+        // Stage 1.11 E3: opt-in (STRATA_MTP_OVERLAP=1) chunk-graph overlap of the MTP draft K/V build with
+        // the main-model prefill; a no-op unless the env var is set.
+        if (!o.mtp.empty()) {
+            mtp.set_overlap(o.prefill_chunk);
+            // The main-model compute stream, so the boundary's R-rows D2D stays ordered on the stream that
+            // rewrites R for the next chunk (keeps the unsynced overlap path race-free).  No-op if overlap
+            // is off (main_cs_ is only consulted when overlap_active()).
+            mtp.set_main_stream((cudaStream_t) main_cs);
+        }
     }
     strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker);
     if (o.no_ple_prefetch) strata::kernels::ple_prefetch_enable(false);

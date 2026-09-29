@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 #include <vector>
@@ -71,7 +72,7 @@ struct Prefill::Impl {
     const core::ExpertCache* cache = nullptr;
     const int32_t* host_res = nullptr;
     int64_t T = 0;
-    cudaStream_t cs = nullptr, copy = nullptr;
+    cudaStream_t cs = nullptr, copy = nullptr, copy2 = nullptr;
     Gemm gemm;
     std::vector<void*> owned;
     // chunk buffers
@@ -99,6 +100,13 @@ struct Prefill::Impl {
     int32_t *ids = nullptr, *slot_dev = nullptr, *src_dev = nullptr;
     uint16_t *Xs = nullptr, *Hh = nullptr, *sh_h = nullptr;
     std::vector<int32_t> ids_host, slot_host, src_host, cnt, off;
+    // Stage 1.11 E4 (opt-in, STRATA_MOE_ASYNC_IDS=1): pinned routing-id buffers + an event so the host
+    // waits only for the 80 KB ids D2H instead of the whole m.cs tail (see the MoE section of run()).
+    bool async_ids = false;
+    cudaEvent_t ids_ev = nullptr;
+    // Stage 1.11 E7 (opt-in, STRATA_TWO_STREAM_DMA=1): a second copy stream; the staging ring's slots
+    // alternate streams so one CE waiting on a slot's GEMM-freed event does not idle the other.
+    bool two_stream = false;
     uint16_t* dq_gu[DQ] = {};
     uint16_t* dq_d[DQ] = {};
     uint8_t* stage_dev[STAGE] = {};
@@ -117,12 +125,19 @@ Prefill::Prefill() : impl_(new Impl) {}
 Prefill::~Prefill() {
     if (!impl_) return;
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
+    if (impl_->async_ids) {
+        cudaHostUnregister(impl_->ids_host.data());
+        cudaHostUnregister(impl_->slot_host.data());
+        cudaHostUnregister(impl_->src_host.data());
+    }
+    if (impl_->ids_ev) cudaEventDestroy(impl_->ids_ev);
     for (int i = 0; i < STAGE; ++i) {
         if (impl_->copied[i]) cudaEventDestroy(impl_->copied[i]);
         if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
         if (impl_->stage_host[i]) cudaFreeHost(impl_->stage_host[i]);
     }
     if (impl_->copy) cudaStreamDestroy(impl_->copy);
+    if (impl_->copy2) cudaStreamDestroy(impl_->copy2);
     for (void* p : impl_->owned) cudaFree(p);
 }
 
@@ -141,6 +156,13 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         err = "prefill: geometry differs from the artifact's"; return false;
     }
     if (cudaStreamCreateWithFlags(&m.copy, cudaStreamNonBlocking) != cudaSuccess) { err = "prefill: copy stream"; return false; }
+    // Stage 1.11 E7 (opt-in, STRATA_TWO_STREAM_DMA=1): a second copy stream for the staging ring (the
+    // V100 has multiple copy engines; alternating ring slots across two streams keeps the PCIe link
+    // busy while one stream waits on a slot's GEMM-freed event).  Default off: everything on m.copy.
+    if (const char* e7 = std::getenv("STRATA_TWO_STREAM_DMA"); e7 && std::string(e7) == "1") {
+        if (cudaStreamCreateWithFlags(&m.copy2, cudaStreamNonBlocking) != cudaSuccess) { err = "prefill: second copy stream"; return false; }
+        m.two_stream = true;
+    }
     const size_t T = (size_t) chunk;
     bool ok = true;
     Alloc o;
@@ -192,6 +214,23 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(NE); m.off.resize(NE + 1);
     m.ple_emb_host.resize(T * N); m.ple_rows.resize(T * strata::kernels::PLE_N_HEADS);
     if (!ok) { err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit"; return false; }
+    // Stage 1.11 E4 (opt-in, STRATA_MOE_ASYNC_IDS=1): pin the routing-id host buffers and create the ids
+    // event so run() can wait only for the 80 KB ids D2H instead of synchronizing the whole m.cs tail.
+    // Default off: the legacy full cudaStreamSynchronize(m.cs) after the ids copy is unchanged.
+    if (const char* e = std::getenv("STRATA_MOE_ASYNC_IDS"); e && std::string(e) == "1") {
+        if (cudaEventCreateWithFlags(&m.ids_ev, cudaEventDisableTiming) != cudaSuccess) { m.ids_ev = nullptr; }
+        if (m.ids_ev &&
+            cudaHostRegister(m.ids_host.data(), m.ids_host.size() * sizeof(int32_t), 0) == cudaSuccess &&
+            cudaHostRegister(m.slot_host.data(), m.slot_host.size() * sizeof(int32_t), 0) == cudaSuccess &&
+            cudaHostRegister(m.src_host.data(), m.src_host.size() * sizeof(int32_t), 0) == cudaSuccess) {
+            m.async_ids = true;
+        } else {
+            if (m.ids_ev) { cudaEventDestroy(m.ids_ev); m.ids_ev = nullptr; }
+            cudaHostUnregister(m.ids_host.data());
+            cudaHostUnregister(m.slot_host.data());
+            cudaHostUnregister(m.src_host.data());
+        }
+    }
     return true;
 }
 
@@ -416,6 +455,17 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (!wr || !wgi || !wsg || !wsu || !wsd) return false;
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err)) return false;
                     route(m.logits, m.ids, m.w, T, m.cs);
+                    // Stage 1.11 E4 (opt-in, STRATA_MOE_ASYNC_IDS=1): start the 80 KB ids D2H (to pinned
+                    // memory) right after route(), before the shared-expert GEMMs that do not need the ids.
+                    // The host waits only for this copy via ids_ev below, so the shared-expert GEMMs keep
+                    // running on m.cs instead of being waited out by the legacy whole-stream synchronize.
+                    if (m.async_ids) {
+                        if (cudaMemcpyAsync(m.ids_host.data(), m.ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
+                            cudaEventRecord(m.ids_ev, m.cs) != cudaSuccess) {
+                            err = std::string("prefill: async ids: ") + cudaGetErrorString(cudaGetLastError());
+                            return false;
+                        }
+                    }
                     // the shared expert and its scalar gate
                     if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
                     if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
@@ -424,8 +474,17 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
                     m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
                     // group the (token, k) pairs by expert on the host
-                    cudaMemcpyAsync(m.ids_host.data(), m.ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
-                    cudaStreamSynchronize(m.cs);
+                    if (m.async_ids) {
+                        // wait only for the ids D2H (already issued after route()); m.cs keeps running the
+                        // shared-expert GEMMs meanwhile.
+                        if (cudaEventSynchronize(m.ids_ev) != cudaSuccess) {
+                            err = std::string("prefill: async ids wait: ") + cudaGetErrorString(cudaGetLastError());
+                            return false;
+                        }
+                    } else {
+                        cudaMemcpyAsync(m.ids_host.data(), m.ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
+                        cudaStreamSynchronize(m.cs);
+                    }
                     std::fill(m.cnt.begin(), m.cnt.end(), 0);
                     for (int64_t i = 0; i < T * K; ++i) {
                         const int32_t e = m.ids_host[(size_t) i];
@@ -460,17 +519,20 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         const auto th = Clock::now();
                         const uint8_t* b = m.src->blob(l, e);
                         if (!b) { err = "prefill: expert source has no blob"; return false; }
+                        // Stage 1.11 E7 (opt-in): alternate ring slots across the two copy streams; each
+                        // slot keeps a single stream, so its H2D order is unchanged.
+                        const cudaStream_t cs2 = (m.two_stream && (sl & 1)) ? m.copy2 : m.copy;
                         if (m.src->pinned(l, e)) {
                             // DMA straight from the page-locked arena: the copy stream only waits for the slot
-                            if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);
-                            cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
+                            if (m.stage_live[sl]) cudaStreamWaitEvent(cs2, m.used[sl], 0);
+                            cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, cs2);
                             ++stats_.experts_dma;
                         } else {
                             if (m.stage_live[sl]) cudaEventSynchronize(m.used[sl]);   // its previous blob was dequantized
                             std::memcpy(m.stage_host[sl], b, (size_t) lay.blob_bytes(l));
-                            cudaMemcpyAsync(m.stage_dev[sl], m.stage_host[sl], (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
+                            cudaMemcpyAsync(m.stage_dev[sl], m.stage_host[sl], (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, cs2);
                         }
-                        cudaEventRecord(m.copied[sl], m.copy);
+                        cudaEventRecord(m.copied[sl], cs2);
                         m.stage_live[sl] = true;
                         stage_of[j] = sl;
                         stats_.ms_experts_host += ms_since(th);

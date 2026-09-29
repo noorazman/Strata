@@ -80,6 +80,11 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
 
 MtpDrafter::~MtpDrafter() {
     if (cs_) cudaStreamSynchronize(cs_);
+    for (auto& kv : ov_execs_) if (kv.second) cudaGraphExecDestroy(kv.second);
+    if (ov_ev_) cudaEventDestroy(ov_ev_);
+    if (ov_copy_ev_) cudaEventDestroy(ov_copy_ev_);
+    if (ov_cs_) cudaStreamDestroy(ov_cs_);
+    if (ov_rin_) cudaFree(ov_rin_);
     for (auto& e : prefill_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : round_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : step_exec_) if (e) cudaGraphExecDestroy(e);
@@ -232,6 +237,26 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
 
 bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err) {
     wt_ = &wt;
+    // Stage 1.11 E3: capture the chunk-sized prefill graph now that wt_ is valid (record_forward looks up
+    // the main model's token embedding in it).  The capture runs SYNCHRONOUSLY on the main thread at this
+    // quiescent point: the expert pool workers are parked and nothing else launches kernels, so the ~0.3 s
+    // of host-side stream-capture work cannot race the main-model prefill.  (A background-thread capture
+    // raced it: on this driver, while any stream capture is active a kernel launch from another thread on
+    // a DIFFERENT stream - here the session compute stream, which is non-blocking - fails with
+    // cudaErrorStreamCaptureUnsupported (900); the capture window must not overlap the first prefill
+    // chunk's launches.)  The one-time cost lands in startup, before the first token.
+    if (ov_chunk_ > 0 && !ov_capture_done_) {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::string e;
+        if (capture_chunk_graph(ov_chunk_, e)) {
+            ov_capture_done_ = true;
+            std::fprintf(stderr, "strata mtp: overlap chunk graph captured in %lld ms (%lld tokens)\n",
+                         (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - t0).count(), (long long) ov_chunk_);
+        } else {
+            std::fprintf(stderr, "strata mtp: overlap chunk graph: %s (falling back to the legacy path)\n", e.c_str());
+        }
+    }
     head_ = head;
     window_R_ = window_R;
     const WeightRef* wo = wt.find("output.weight");
@@ -265,8 +290,103 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
     return true;
 }
 
+// Stage 1.11 E3 (opt-in, STRATA_MTP_OVERLAP=1): the per-chunk-boundary K/V build as one chunk-sized graph.
+// The prompt's R rows are moved with a single D2D, the deep mapped fill buffer is written once per
+// boundary, and the whole n-token build launches as one graph on cs_ - no per-sub-chunk host sync, so the
+// next chunk's main-model prefill overlaps it. This call only allocates the overlap buffers; the chunk
+// graph itself is captured synchronously at bind() (see bind). A boundary with an exact n that was never
+// captured is lazy-captured on the main thread (or falls back to the normal path).
+void MtpDrafter::set_overlap(int64_t chunk) {
+    if (chunk < max_t_ || ov_chunk_ != 0) return;
+    if (!std::getenv("STRATA_MTP_OVERLAP")) return;
+    const int64_t NH = g_->n_head, HCN = g_->hc * g_->n_embd;
+    void* h_tok = nullptr; int32_t* m_tok = nullptr;
+    void* h_step = nullptr; int32_t* m_step = nullptr;
+    void* h_pos = nullptr; int32_t* m_pos = nullptr;
+    float* rin = nullptr;
+    if (!mapped((size_t) (chunk + 64) * 4, &h_tok, (void**) &m_tok) ||
+        !mapped((size_t) (chunk * 4 + 64) * 4, &h_step, (void**) &m_step) ||
+        !mapped((size_t) (chunk * (uint64_t) NH + 64) * 4, &h_pos, (void**) &m_pos) ||
+        cudaMalloc((void**) &rin, (size_t) chunk * HCN * sizeof(float)) != cudaSuccess ||
+        cudaStreamCreateWithFlags(&ov_cs_, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaEventCreateWithFlags(&ov_ev_, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&ov_copy_ev_, cudaEventDisableTiming) != cudaSuccess) {
+        cudaFreeHost(h_tok); cudaFreeHost(h_step); cudaFreeHost(h_pos);
+        if (rin) cudaFree(rin);
+        if (ov_cs_) { cudaStreamDestroy(ov_cs_); ov_cs_ = nullptr; }
+        if (ov_ev_) { cudaEventDestroy(ov_ev_); ov_ev_ = nullptr; }
+        if (ov_copy_ev_) { cudaEventDestroy(ov_copy_ev_); ov_copy_ev_ = nullptr; }
+        std::fprintf(stderr, "strata mtp: overlap buffers do not fit; prefill overlap off\n");
+        ov_chunk_ = -1;
+        return;
+    }
+    // no graph capture has happened yet (bind precedes the first capture): the deep buffers replace the
+    // max_t_-sized ones and every later capture bakes in the new pointers.
+    cudaFreeHost(h_tok_); cudaFreeHost(h_step_); cudaFreeHost(h_pos_);
+    h_tok_ = (int32_t*) h_tok; m_tok_ = m_tok;
+    h_step_ = (int32_t*) h_step; m_step_ = m_step;
+    h_pos_ = (int32_t*) h_pos; m_pos_ = m_pos;
+    ov_rin_ = rin;
+    ov_chunk_ = chunk;
+    // The capture itself runs in bind(): record_forward looks up the main model's token embedding in
+    // wt_, which only exists there (set_overlap runs before the main WeightTable is handed over).
+    std::fprintf(stderr, "strata mtp: prefill overlap ON (chunk-sized graph for %lld tokens, "
+                 "captured synchronously at bind)\n", (long long) chunk);
+}
+
+// One graph per exact n: ceil(n / max_t_) sub-chunk record_forwards whose row inputs read the deep mapped
+// buffers at offset i * max_t_.  Runs on the capture thread (cs_ is idle: nothing else uses it in prefill).
+bool MtpDrafter::capture_chunk_graph(int64_t n, std::string& err) {
+    using namespace strata::kernels;
+    const int64_t NH = g_->n_head, HCN = g_->hc * g_->n_embd, S = max_t_;
+    const int64_t n_full = n / S, rem = n % S;
+    // The sub-chunk i copy nodes move the deep host region [i*S, i*S+S) into the device row buffers' HEAD
+    // (the record_forward kernels always read the head, as in the legacy per-sub-chunk loop); the sub-chunks
+    // are serialized on one stream so the head is sub-chunk i's data when its forward reads it.  Only the R
+    // rows stay at per-sub-chunk offsets: ov_rin_ holds all n rows of the prompt.
+    cudaStream_t cs = ov_cs_ ? ov_cs_ : cs_;
+    cudaStreamSynchronize(cs);
+    if (cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: overlap begin capture"; return false; }
+    bool ok = true;
+    for (int64_t i = 0; ok && i < n_full; ++i) {
+        copy_i32_from_mapped(tok_, m_tok_ + i * S, S, cs);
+        copy_i32_from_mapped(step_, m_step_ + i * S * 4, S * 4, cs);
+        copy_i32_from_mapped(pos_, m_pos_ + i * S * NH, S * NH, cs);
+        ok = record_forward((int) S, -1, cs, err, nullptr, nullptr, nullptr, ov_rin_ + i * S * HCN);
+    }
+    if (ok && rem > 0) {
+        const int64_t off = n_full * S;
+        copy_i32_from_mapped(tok_, m_tok_ + off, rem, cs);
+        copy_i32_from_mapped(step_, m_step_ + off * 4, rem * 4, cs);
+        copy_i32_from_mapped(pos_, m_pos_ + off * NH, rem * NH, cs);
+        ok = record_forward((int) rem, -1, cs, err, nullptr, nullptr, nullptr, ov_rin_ + off * HCN);
+    }
+    cudaGraph_t graph = nullptr;
+    const cudaError_t ce = cudaStreamEndCapture(cs, &graph);
+    if (!ok || ce != cudaSuccess) {
+        if (graph) cudaGraphDestroy(graph);
+        if (err.empty()) err = "mtp: overlap end capture";
+        return false;
+    }
+    cudaGraphExec_t exec = nullptr;
+    if (cudaGraphInstantiate(&exec, graph, 0) != cudaSuccess) {
+        cudaGraphDestroy(graph);
+        err = "mtp: overlap instantiate";
+        return false;
+    }
+    cudaGraphDestroy(graph);
+    cudaGraphUpload(exec, cs);
+    cudaStreamSynchronize(cs);
+    ov_execs_.emplace_back(n, exec);
+    return true;
+}
+
 // The layer for T rows.  full = false stops after the K/V append (the prompt only needs the cache).
-bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::string& err) {
+// The *_base arguments (Stage 1.11 E3) point the row inputs at an offset region (the chunk-graph sub-chunks
+// fill one deep mapped buffer and the sub-chunk i graph reads it at offset i * max_t_); defaults keep the
+// decode captures byte-identical.
+bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::string& err, const int32_t* tok_base,
+                                const int32_t* step_base, const int32_t* pos_base, const float* rin_base) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
@@ -277,25 +397,27 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
     const int64_t N = g.n_embd, HC = g.hc, K = ss.k, NH = g.n_head, HD = g.head_dim, NKV = g.n_head_kv;
     const QsaShapes s = shapes_of(g);
     const GrShapes gs{g.n_embd, g.hc, g.hc_lr};
-    const int32_t* step = step_ + row0 * 4;
-    const int32_t* pos = pos_ + row0 * NH;
+    const int32_t* tokb = tok_base ? tok_base : tok_;
+    const int32_t* step = (step_base ? step_base : step_) + row0 * 4;
+    const int32_t* pos = (pos_base ? pos_base : pos_) + row0 * NH;
+    const float* rinb = rin_base ? rin_base : Rin_;
     try {
         // ---- the two input branches
         const WeightRef* we = wt_->find("token_embd.weight");
         if (!we) { err = "mtp: token_embd.weight is missing"; return false; }
         if (const NativeEmbed* ne = native_embed()) {   // plan v0.3 P6: the GGUF-form table
-            ne->gather_dev(tok_, T, emb_, cs);
+            ne->gather_dev(tokb, T, emb_, cs);
         } else {
             const auto* codes = (const uint8_t*) we->data;
             const auto* scales = (const float*) (codes + we->codes_bytes);
             const auto* offsets = we->has_offset ? (const float*) (codes + we->codes_bytes + we->scales_bytes) : nullptr;
-            embedding_gather_dev(codes, scales, offsets, tok_, T, we->ne0, we->code_bits, we->code_bias, we->group_elems,
+            embedding_gather_dev(codes, scales, offsets, tokb, T, we->ne0, we->code_bits, we->code_bias, we->group_elems,
                                  (uint64_t) (we->ne0 / (8 / we->code_bits)), (uint64_t) (we->ne0 / we->group_elems), emb_, cs);
         }
         native_qsa_rms_norm_weighted(emb_, f32("pre_fc_norm_embedding.weight"), en_, (int) N, T, EPS, cs);
         native_quantize_q8_1(en_, xq_, (int) N, T, cs);
         native_mmvq(GGML_Q8_0, q8("fc_embedding.weight"), xq_, e2_, (int) N, (int) N, T, cs);
-        native_qsa_rms_norm_weighted(Rin_, f32("pre_fc_norm_hidden.weight"), hn_, (int) (HC * N), T, EPS, cs);
+        native_qsa_rms_norm_weighted(rinb, f32("pre_fc_norm_hidden.weight"), hn_, (int) (HC * N), T, EPS, cs);
         for (int c0 = 0; c0 < T * HC; c0 += 8) {
             const int nc = (int) std::min<int64_t>(8, T * HC - c0);
             native_quantize_q8_1(hn_ + (size_t) c0 * N, xq_, (int) N, nc, cs);
@@ -499,6 +621,52 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
     const int64_t HCN = g_->hc * g_->n_embd;
     // cells the window can never reach again need no K/V
     const int64_t first_needed = (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0;
+    if (overlap_active() && n >= 1 && n <= ov_chunk_) {
+        if (cell0 + n <= first_needed) { ms_prefill += ms_since(t0); return true; }
+        cudaGraphExec_t exec = nullptr;
+        for (auto& kv : ov_execs_) if (kv.first == n) exec = kv.second;
+        if (ov_capture_done_ && !exec && capture_chunk_graph(n, err)) {
+            for (auto& kv : ov_execs_) if (kv.first == n) exec = kv.second;
+            err.clear();
+        }
+        if (exec) {
+            if (ov_ev_valid_) {
+                if (cudaEventSynchronize(ov_ev_) != cudaSuccess) { err = "mtp: overlap wait"; return false; }
+                ov_ev_valid_ = false;
+            }
+            const int64_t NH = g_->n_head;
+            for (int64_t t = 0; t < n; ++t) {
+                const int64_t cell = cell0 + t;
+                h_tok_[t] = next_tokens[t];
+                h_step_[t * 4 + 0] = (int32_t) cell;
+                h_step_[t * 4 + 1] = (int32_t) (cell + 1);
+                h_step_[t * 4 + 2] = (int32_t) ((cell + 1) / 4);
+                h_step_[t * 4 + 3] = (int32_t) (cell + 1);
+                for (int64_t h = 0; h < NH; ++h) h_pos_[t * NH + h] = (int32_t) cell;
+            }
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            // The R-rows D2D runs on the MAIN model's stream when one was handed over: that stream owns
+            // R_rows and rewrites it for the next chunk, so in-stream order the copy finishes before the
+            // rewrite (the legacy path masked this with its per-sub-chunk cudaStreamSynchronize).  The
+            // chunk graph on cs_ then waits for the copy via ov_copy_ev_; without the wait it could read
+            // ov_rin_ before the copy lands.  The graph's ~170 ms of compute still overlaps the next
+            // chunk's main-model prefill - only the copy (~50 us) is on the critical path.
+            const cudaStream_t copy_cs = (main_cs_ && main_cs_ != cs_) ? main_cs_ : cs_;
+            if (cudaMemcpyAsync(ov_rin_, R_rows, (size_t) n * HCN * sizeof(float), cudaMemcpyDeviceToDevice,
+                                copy_cs) != cudaSuccess ||
+                (copy_cs != cs_ && (cudaEventRecord(ov_copy_ev_, copy_cs) != cudaSuccess ||
+                                    cudaStreamWaitEvent(cs_, ov_copy_ev_, 0) != cudaSuccess)) ||
+                cudaGraphLaunch(exec, cs_) != cudaSuccess) {
+                err = std::string("mtp prefill overlap: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            cudaEventRecord(ov_ev_, cs_);
+            ov_ev_valid_ = true;
+            ms_prefill += ms_since(t0);
+            return true;
+        }
+        // first boundary before the background capture finished: the normal path below
+    }
     for (int64_t c = 0; c < n; c += max_t_) {
         const int T = (int) std::min<int64_t>(max_t_, n - c);
         if (cell0 + c + T <= first_needed) continue;

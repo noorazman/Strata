@@ -29,7 +29,8 @@ die() { echo "[$(date +%H:%M:%S)] FATAL: $*"; exit 1; }
 start_server() { # $1 = config json
   local cfg="$1"
   local tag="s110-$(basename "$cfg" .json)"
-  CUDA_VISIBLE_DEVICES=0 LD_LIBRARY_PATH=/usr/local/cuda/lib64 STRATA_TTFT=1 \
+  # Stage 1.11: EXTRA_ENV (e.g. STRATA_MTP_OVERLAP=1) reaches the engine through the serve process
+  CUDA_VISIBLE_DEVICES=0 LD_LIBRARY_PATH=/usr/local/cuda/lib64 STRATA_TTFT=1 env ${EXTRA_ENV:-} \
     nohup .venv/bin/python -m serve.server --engine strata --config "$cfg" --host 127.0.0.1 --port 8180 \
     > "Logs/gpu/${tag}.serve.log" 2>&1 &
   SERVER_PID=$!

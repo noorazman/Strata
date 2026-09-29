@@ -1,0 +1,35 @@
+{
+ "mtp_mib": 800.0,
+ "label": "s111e3-smoke4k",
+ "gpu": 0,
+ "workers": 24,
+ "max_new": 32,
+ "max_context": 8192,
+ "kv": "int8",
+ "n_prompt": 4096,
+ "wall_s": 1159.3,
+ "engine_rc": 139,
+ "peak_vram_mib": 23284,
+ "peak_gpu_util": 100,
+ "mem_before": {
+  "mem_total_gib": 125.77682495117188,
+  "mem_available_gib": 35.51374053955078,
+  "cached_gib": 54397068.28320694
+ },
+ "mem_after": {
+  "mem_total_gib": 125.77682495117188,
+  "mem_available_gib": 104.56315231323242,
+  "cached_gib": 57320772.274707794
+ },
+ "command_tail": "--expert-cache auto --prefill 2048 --spec 4 --spec-min-p 0.5 --pool-workers 24 --mtp mtp/rt --max-context 8192 --kv int8 --max-new 32 --tokens-file Logs/gpu/s111ncu4k-tokens.txt --stats",
+ "cpu": {
+  "cpu_total_mean_pct": 7.1,
+  "cpu_total_peak_pct": 29.7,
+  "cpu_core_mean_pct": 7.1,
+  "cpu_core_peak_pct": 100.0,
+  "cores_mean_ge50pct": [
+   "0:92%",
+   "2:53%"
+  ]
+ }
+}

@@ -1,0 +1,37 @@
+{
+ "exe": "/home/noorazman/dsh/strata/Strata/build-sm70/strata",
+ "args": [
+  "--pack",
+  "packs/swift-iq3_xxs",
+  "--native",
+  "/mnt/ssd/llm_models/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+  "--ple-gguf",
+  "/mnt/ssd/llm_models/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+  "--expert-profile",
+  "data/expert-profile.bin",
+  "--expert-cache",
+  "auto",
+  "--prefill",
+  "2048",
+  "--spec",
+  "4",
+  "--spec-min-p",
+  "0.5",
+  "--pool-workers",
+  "24",
+  "--mtp",
+  "mtp/rt",
+  "--kv",
+  "int8",
+  "--max-context",
+  "131072"
+ ],
+ "cwd": "/home/noorazman/dsh/strata/Strata",
+ "tokenizer": "packs/swift-iq3_xxs/tokenizer",
+ "model_name": "swift-iq3_xxs-ctx131072",
+ "log": "/home/noorazman/dsh/strata/Strata/Logs/benchmarks/s110-ctx-131072-engine.log",
+ "lib_dirs": [
+  "/usr/local/cuda/lib64"
+ ],
+ "port": 8180
+}

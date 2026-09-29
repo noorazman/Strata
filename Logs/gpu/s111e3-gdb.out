@@ -1,0 +1,45 @@
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+strata generate: this CPU has no AVX-512: the expert kernels run on AVX2
+[New Thread 0x7ff6751ff000 (LWP 174788)]
+[New Thread 0x7ff668dde000 (LWP 174789)]
+strata generate: native pack: packs/swift-iq3_xxs experts (largest blob 2.33 MB), token embedding type 21 in mapped host memory (260 MiB)
+strata generate: 1466 MiB of weights loaded from packs/swift-iq3_xxs (302 canonical tensors skipped: served natively)
+strata generate: 300 native projection matrices, 1781.11 MiB of weights
+[New Thread 0x7fffb89ff000 (LWP 175930)]
+[New Thread 0x7ff87960b000 (LWP 175931)]
+[New Thread 0x7ff878e0a000 (LWP 175932)]
+[New Thread 0x7ff878609000 (LWP 175933)]
+[New Thread 0x7ff877e08000 (LWP 175934)]
+[New Thread 0x7ff877607000 (LWP 175935)]
+[New Thread 0x7ff876e06000 (LWP 175936)]
+[New Thread 0x7ff876605000 (LWP 175937)]
+[New Thread 0x7ff875e04000 (LWP 175938)]
+[New Thread 0x7ff875603000 (LWP 175939)]
+[New Thread 0x7ff874e02000 (LWP 175940)]
+[New Thread 0x7ff874601000 (LWP 175941)]
+[New Thread 0x7ff873e00000 (LWP 175942)]
+[New Thread 0x7ff8735ff000 (LWP 175943)]
+[New Thread 0x7ff872dfe000 (LWP 175944)]
+[Thread 0x7ff875e04000 (LWP 175938) exited]
+[Thread 0x7ff874e02000 (LWP 175940) exited]
+[Thread 0x7ff8735ff000 (LWP 175943) exited]
+[Thread 0x7ff873e00000 (LWP 175942) exited]
+[Thread 0x7ff877607000 (LWP 175935) exited]
+[Thread 0x7ff874601000 (LWP 175941) exited]
+[Thread 0x7ff87960b000 (LWP 175931) exited]
+[Thread 0x7ff876605000 (LWP 175937) exited]
+[Thread 0x7ff876e06000 (LWP 175936) exited]
+[Thread 0x7ff877e08000 (LWP 175934) exited]
+[Thread 0x7ff875603000 (LWP 175939) exited]
+[Thread 0x7ff872dfe000 (LWP 175944) exited]
+[Thread 0x7ff878e0a000 (LWP 175932) exited]
+[Thread 0x7ff878609000 (LWP 175933) exited]
+[Thread 0x7fffb89ff000 (LWP 175930) exited]
+strata generate: PLE ram: preloaded 320001536 rows (26.82 GiB) in 50.91 s (0.53 GiB/s); RAM-resident for the whole run
+strata generate: PLE on, table 320001536 rows of /mnt/ssd/llm_models/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf (PLE I/O mode: ram)
+Exception ignored in: <gdb._GdbOutputFile object at 0x75d140492ad0>
+Traceback (most recent call last):
+  File "/usr/share/gdb/python/gdb/__init__.py", line 47, in flush
+    def flush(self):
+KeyboardInterrupt: 

@@ -1,0 +1,72 @@
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+strata generate: this CPU has no AVX-512: the expert kernels run on AVX2
+[New Thread 0x7ff6751ff000 (LWP 180113)]
+[New Thread 0x7ff668dde000 (LWP 180114)]
+strata generate: native pack: packs/swift-iq3_xxs experts (largest blob 2.33 MB), token embedding type 21 in mapped host memory (260 MiB)
+strata generate: 1466 MiB of weights loaded from packs/swift-iq3_xxs (302 canonical tensors skipped: served natively)
+strata generate: 300 native projection matrices, 1781.11 MiB of weights
+[New Thread 0x7fffb89ff000 (LWP 180141)]
+[New Thread 0x7ff87960b000 (LWP 180142)]
+[New Thread 0x7ff878e0a000 (LWP 180143)]
+[New Thread 0x7ff878609000 (LWP 180144)]
+[New Thread 0x7ff877e08000 (LWP 180145)]
+[New Thread 0x7ff877607000 (LWP 180146)]
+[New Thread 0x7ff876e06000 (LWP 180147)]
+[New Thread 0x7ff876605000 (LWP 180148)]
+[New Thread 0x7ff875e04000 (LWP 180149)]
+[New Thread 0x7ff875603000 (LWP 180150)]
+[New Thread 0x7ff874e02000 (LWP 180151)]
+[New Thread 0x7ff874601000 (LWP 180152)]
+[New Thread 0x7ff873e00000 (LWP 180153)]
+[New Thread 0x7ff8735ff000 (LWP 180154)]
+[New Thread 0x7ff872dfe000 (LWP 180155)]
+[Thread 0x7ff877e08000 (LWP 180145) exited]
+[Thread 0x7ff874601000 (LWP 180152) exited]
+[Thread 0x7ff876e06000 (LWP 180147) exited]
+[Thread 0x7ff875603000 (LWP 180150) exited]
+[Thread 0x7fffb89ff000 (LWP 180141) exited]
+[Thread 0x7ff878609000 (LWP 180144) exited]
+[Thread 0x7ff875e04000 (LWP 180149) exited]
+[Thread 0x7ff87960b000 (LWP 180142) exited]
+[Thread 0x7ff874e02000 (LWP 180151) exited]
+[Thread 0x7ff873e00000 (LWP 180153) exited]
+[Thread 0x7ff877607000 (LWP 180146) exited]
+[Thread 0x7ff878e0a000 (LWP 180143) exited]
+[Thread 0x7ff872dfe000 (LWP 180155) exited]
+[Thread 0x7ff8735ff000 (LWP 180154) exited]
+[Thread 0x7ff876605000 (LWP 180148) exited]
+strata generate: PLE ram: preloaded 320001536 rows (26.82 GiB) in 24.07 s (1.11 GiB/s); RAM-resident for the whole run
+strata generate: PLE on, table 320001536 rows of /mnt/ssd/llm_models/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf (PLE I/O mode: ram)
+strata experts: arena first-touch pinned to node 0 (default: the host thread's node (Stage 1.6))
+[New Thread 0x7ff872dfe000 (LWP 180194)]
+[New Thread 0x7ff8735ff000 (LWP 180195)]
+[New Thread 0x7ff873e00000 (LWP 180196)]
+[New Thread 0x7ff874601000 (LWP 180197)]
+[New Thread 0x7ff87885d000 (LWP 180198)]
+[Thread 0x7ff872dfe000 (LWP 180194) exited]
+[Thread 0x7ff874601000 (LWP 180197) exited]
+[Thread 0x7ff873e00000 (LWP 180196) exited]
+[Thread 0x7ff8735ff000 (LWP 180195) exited]
+[Thread 0x7ff87885d000 (LWP 180198) exited]
+strata generate: expert arena: cudaHostRegister PORTABLE ok; MAP_HUGETLB unavailable (no hugetlb pool configured?); using 4 KB pages
+strata generate: loaded 39.97 GiB at 1.14 GiB/s
+strata mtp: draft layer loaded, 800 MiB of VRAM (experts 675, dense 111)
+strata mtp: prefill overlap ON (chunk-sized graph for 2048 tokens, captured in background)
+[New Thread 0x7ff87885d000 (LWP 180238)]
+
+Thread 24 "strata" received signal SIGSEGV, Segmentation fault.
+[Switching to Thread 0x7ff87885d000 (LWP 180238)]
+0x0000555555662776 in strata::core::WeightTable::find(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) const ()
+#0  0x0000555555662776 in strata::core::WeightTable::find(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) const ()
+#1  0x00005555555c6033 in strata::core::MtpDrafter::record_forward(int, int, CUstream_st*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >&, int const*, int const*, int const*, float const*) [clone .constprop.0] ()
+#2  0x00005555555c6b17 in strata::core::MtpDrafter::capture_chunk_graph(long, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >&) ()
+#3  0x00005555555c7236 in std::thread::_State_impl<std::thread::_Invoker<std::tuple<strata::core::MtpDrafter::set_overlap(long)::{lambda()#1}> > >::_M_run() ()
+#4  0x00007ffff10dc253 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#5  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#6  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+  Id   Target Id                                            Frame 
+  1    Thread 0x7ffff7bd8000 (LWP 180110) "strata"          __memmove_avx_unaligned_erms_rtm () at ../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:642
+  2    Thread 0x7ff6751ff000 (LWP 180113) "cuda00001800007" 0x00007ffff0d18d1f in __GI___poll (fds=0x55555673ba70, nfds=3, timeout=-1) at ../sysdeps/unix/sysv/linux/poll.c:29
+  3    Thread 0x7ff668dde000 (LWP 180114) "cuda-EvtHandlr"  0x00007ffff0d18d1f in __GI___poll (fds=0x7ff664000cf0, nfds=15, timeout=100) at ../sysdeps/unix/sysv/linux/poll.c:29
+* 24   Thread 0x7ff87885d000 (LWP 180238) "strata"          0x0000555555662776 in strata::core::WeightTable::find(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) const ()

@@ -1,0 +1,365 @@
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+strata generate: this CPU has no AVX-512: the expert kernels run on AVX2
+[New Thread 0x7ff6751ff000 (LWP 183929)]
+[New Thread 0x7ff668dde000 (LWP 183930)]
+strata generate: native pack: packs/swift-iq3_xxs experts (largest blob 2.33 MB), token embedding type 21 in mapped host memory (260 MiB)
+strata generate: 1466 MiB of weights loaded from packs/swift-iq3_xxs (302 canonical tensors skipped: served natively)
+strata generate: 300 native projection matrices, 1781.11 MiB of weights
+[New Thread 0x7fffb89ff000 (LWP 183936)]
+[New Thread 0x7ff87960b000 (LWP 183937)]
+[New Thread 0x7ff878e0a000 (LWP 183938)]
+[New Thread 0x7ff878609000 (LWP 183939)]
+[New Thread 0x7ff877e08000 (LWP 183940)]
+[New Thread 0x7ff877607000 (LWP 183941)]
+[New Thread 0x7ff876e06000 (LWP 183942)]
+[New Thread 0x7ff876605000 (LWP 183943)]
+[New Thread 0x7ff875e04000 (LWP 183944)]
+[New Thread 0x7ff875603000 (LWP 183945)]
+[New Thread 0x7ff874e02000 (LWP 183946)]
+[New Thread 0x7ff874601000 (LWP 183947)]
+[New Thread 0x7ff873e00000 (LWP 183948)]
+[New Thread 0x7ff8735ff000 (LWP 183949)]
+[New Thread 0x7ff872dfe000 (LWP 183950)]
+[Thread 0x7ff872dfe000 (LWP 183950) exited]
+[Thread 0x7ff8735ff000 (LWP 183949) exited]
+[Thread 0x7ff874601000 (LWP 183947) exited]
+[Thread 0x7ff874e02000 (LWP 183946) exited]
+[Thread 0x7ff873e00000 (LWP 183948) exited]
+[Thread 0x7fffb89ff000 (LWP 183936) exited]
+[Thread 0x7ff875e04000 (LWP 183944) exited]
+[Thread 0x7ff875603000 (LWP 183945) exited]
+[Thread 0x7ff878e0a000 (LWP 183938) exited]
+[Thread 0x7ff878609000 (LWP 183939) exited]
+[Thread 0x7ff876e06000 (LWP 183942) exited]
+[Thread 0x7ff87960b000 (LWP 183937) exited]
+[Thread 0x7ff876605000 (LWP 183943) exited]
+[Thread 0x7ff877607000 (LWP 183941) exited]
+[Thread 0x7ff877e08000 (LWP 183940) exited]
+strata generate: PLE ram: preloaded 320001536 rows (26.82 GiB) in 22.78 s (1.18 GiB/s); RAM-resident for the whole run
+strata generate: PLE on, table 320001536 rows of /mnt/ssd/llm_models/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf (PLE I/O mode: ram)
+strata experts: arena first-touch pinned to node 0 (default: the host thread's node (Stage 1.6))
+[New Thread 0x7ff872dfe000 (LWP 184011)]
+[New Thread 0x7ff8735ff000 (LWP 184012)]
+[New Thread 0x7ff873e00000 (LWP 184013)]
+[New Thread 0x7ff874601000 (LWP 184014)]
+[New Thread 0x7ff87885d000 (LWP 184015)]
+[Thread 0x7ff873e00000 (LWP 184013) exited]
+[Thread 0x7ff874601000 (LWP 184014) exited]
+[Thread 0x7ff8735ff000 (LWP 184012) exited]
+[Thread 0x7ff87885d000 (LWP 184015) exited]
+strata generate: expert arena: cudaHostRegister PORTABLE ok; MAP_HUGETLB unavailable (no hugetlb pool configured?); using 4 KB pages
+strata generate: loaded 39.97 GiB at 1.13 GiB/s
+[Thread 0x7ff872dfe000 (LWP 184011) exited]
+strata mtp: draft layer loaded, 800 MiB of VRAM (experts 675, dense 111)
+strata mtp: prefill overlap ON (chunk-sized graph for 2048 tokens, capture starts at bind, in background)
+[New Thread 0x7ff87885d000 (LWP 184055)]
+[New Thread 0x7ff874601000 (LWP 184056)]
+[New Thread 0x7ff873e00000 (LWP 184057)]
+[New Thread 0x7ff8735ff000 (LWP 184058)]
+[New Thread 0x7fffb89ff000 (LWP 184059)]
+[New Thread 0x7ff87960b000 (LWP 184060)]
+[New Thread 0x7ff87805c000 (LWP 184061)]
+[New Thread 0x7ff87785b000 (LWP 184062)]
+[New Thread 0x7ff87705a000 (LWP 184063)]
+[New Thread 0x7ff876859000 (LWP 184064)]
+[New Thread 0x7ff876058000 (LWP 184065)]
+[New Thread 0x7ff875857000 (LWP 184066)]
+[New Thread 0x7ff875056000 (LWP 184067)]
+[New Thread 0x7ff872dfe000 (LWP 184068)]
+[New Thread 0x7ff8725fd000 (LWP 184069)]
+[New Thread 0x7ff871dfc000 (LWP 184070)]
+[New Thread 0x7ff8715fb000 (LWP 184071)]
+[New Thread 0x7ff870dfa000 (LWP 184072)]
+[New Thread 0x7ff855fff000 (LWP 184073)]
+[New Thread 0x7ff8557fe000 (LWP 184074)]
+[New Thread 0x7ff854ffd000 (LWP 184075)]
+[New Thread 0x7ff81ffff000 (LWP 184076)]
+[New Thread 0x7ff81f7fe000 (LWP 184077)]
+[New Thread 0x7ff81effd000 (LWP 184078)]
+strata generate: profile data/expert-profile.bin: 8000 ranked pairs, built for 8000 slots
+strata generate: expert cache auto: 26.78 GiB free, 700 MiB reserved -> 8000 slots
+strata generate: expert cache 8000 slots, 12.93 GiB of VRAM; policy is
+strata generate: *** WARNING: --expert-cache is enabled and the GPU hit path is NOT
+                 CORRECT. The generated tokens diverge from a cache-off run (measured:
+                 first difference at token 40 at 2.97% hits, token 0 at 54.4%). Any
+                 timing from this run is real; any OUTPUT from it is not. ***
+                 PROFILE, ranked by routing frequency, no eviction.
+strata generate: pre-filled 8000 of 8000 slots from the profile; slot 0 verified
+strata generate: R4 hit path ON - resident experts are computed on the GPU
+strata generate: 24 expert-pool workers + the host thread (worker park: hybrid spin-2048us+futex (default), rows: async (workers raise flag C))
+strata generate: session is up; locating the head
+strata generate: experimental native Q5_K head, 437043200 bytes
+strata generate: token graph hit path: 8000 resident experts, decided on the device
+strata generate: prompt path borrows 923 cache slots (1.50 GiB)
+strata mtp: [ov] capture phase 0: sync+begin (n=2048)
+[New Thread 0x7ff801fff000 (LWP 184079)]
+strata mtp: draft head over 40525 tokens (68.0 MiB)
+iq_dequant_f32: operation not permitted when stream is capturing [tid=0x7ffff7bd8000]
+strata: pthread_mutex_lock.c:130: ___pthread_mutex_lock: Assertion `mutex->__data.__owner == 0' failed.
+
+Thread 48 "strata" received signal SIGABRT, Aborted.
+[Switching to Thread 0x7ff801fff000 (LWP 184079)]
+__pthread_kill_implementation (no_tid=0, signo=6, threadid=140703162167296) at ./nptl/pthread_kill.c:44
+44	./nptl/pthread_kill.c: No such file or directory.
+#0  __pthread_kill_implementation (no_tid=0, signo=6, threadid=140703162167296) at ./nptl/pthread_kill.c:44
+#1  __pthread_kill_internal (signo=6, threadid=140703162167296) at ./nptl/pthread_kill.c:78
+#2  __GI___pthread_kill (threadid=140703162167296, signo=signo@entry=6) at ./nptl/pthread_kill.c:89
+#3  0x00007ffff0c42476 in __GI_raise (sig=sig@entry=6) at ../sysdeps/posix/raise.c:26
+#4  0x00007ffff0c287f3 in __GI_abort () at ./stdlib/abort.c:79
+#5  0x00007ffff0c2871b in __assert_fail_base (fmt=0x7ffff0ddd150 "%s%s%s:%u: %s%sAssertion `%s' failed.\n%n", assertion=0x7ffff0dd9599 "mutex->__data.__owner == 0", file=0x7ffff0dd956e "pthread_mutex_lock.c", line=130, function=<optimized out>) at ./assert/assert.c:94
+#6  0x00007ffff0c39e96 in __GI___assert_fail (assertion=assertion@entry=0x7ffff0dd9599 "mutex->__data.__owner == 0", file=file@entry=0x7ffff0dd956e "pthread_mutex_lock.c", line=line@entry=130, function=function@entry=0x7ffff0de1870 <__PRETTY_FUNCTION__.0> "___pthread_mutex_lock") at ./assert/assert.c:103
+#7  0x00007ffff0c9814d in ___pthread_mutex_lock (mutex=<optimized out>) at ./nptl/pthread_mutex_lock.c:130
+#8  0x00007ffff7c41dd4 in ?? () from /usr/local/cuda/lib64/libcudart.so.12
+#9  0x00007ffff7c4408b in ?? () from /usr/local/cuda/lib64/libcudart.so.12
+#10 0x00007ffff7c1410c in ?? () from /usr/local/cuda/lib64/libcudart.so.12
+#11 0x00007ffff7c7d173 in cudaLaunchKernel () from /usr/local/cuda/lib64/libcudart.so.12
+#12 0x00005555555f66f3 in cudaError cudaLaunchKernel<char>(char*, dim3, dim3, void**, unsigned long, CUstream_st*) ()
+#13 0x00005555555f62c7 in __device_stub__ZN6strata7kernels27copy_i32_from_mapped_kernelEPiPVKii(int*, int const volatile*, int) ()
+#14 0x00005555555f630e in strata::kernels::copy_i32_from_mapped_kernel(int*, int const volatile*, int) ()
+#15 0x00005555555f4998 in strata::kernels::copy_i32_from_mapped(int*, int const*, long, void*) ()
+#16 0x00005555555c6a8b in strata::core::MtpDrafter::capture_chunk_graph(long, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >&) ()
+#17 0x00005555555c7236 in std::thread::_State_impl<std::thread::_Invoker<std::tuple<strata::core::MtpDrafter::bind(strata::core::WeightTable const&, strata::core::NativeHead const*, float const*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >&)::{lambda()#1}> > >::_M_run() ()
+#18 0x00007ffff10dc253 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#19 0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#20 0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+  Id   Target Id                                            Frame 
+  1    Thread 0x7ffff7bd8000 (LWP 183905) "strata"          0x00007ffff19081ff in ?? () from /usr/local/cuda/lib64/libcublas.so.12
+  2    Thread 0x7ff6751ff000 (LWP 183929) "cuda00001800007" 0x00007ffff0d18d1f in __GI___poll (fds=0x55555673ca70, nfds=3, timeout=-1) at ../sysdeps/unix/sysv/linux/poll.c:29
+  3    Thread 0x7ff668dde000 (LWP 183930) "cuda-EvtHandlr"  0x00007ffff0d18d1f in __GI___poll (fds=0x7ff664000cf0, nfds=15, timeout=100) at ../sysdeps/unix/sysv/linux/poll.c:29
+  24   Thread 0x7ff87885d000 (LWP 184055) "strata"          syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+  25   Thread 0x7ff874601000 (LWP 184056) "strata"          syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+  26   Thread 0x7ff873e00000 (LWP 184057) "strata"          syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+  27   Thread 0x7ff8735ff000 (LWP 184058) "strata"          syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+  28   Thread 0x7fffb89ff000 (LWP 184059) "strata"          syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+  29   Thread 0x7ff87960b000 (LWP 184060) "strata"          syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+  30   Thread 0x7ff87805c000 (LWP 184061) "strata"          syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+  31   Thread 0x7ff87785b000 (LWP 184062) "strata"          syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+  32   Thread 0x7ff87705a000 (LWP 184063) "strata"          syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+  33   Thread 0x7ff876859000 (LWP 184064) "strata"          syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+  34   Thread 0x7ff876058000 (LWP 184065) "strata"          syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+  35   Thread 0x7ff875857000 (LWP 184066) "strata"          syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+  36   Thread 0x7ff875056000 (LWP 184067) "strata"          syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+  37   Thread 0x7ff872dfe000 (LWP 184068) "strata"          syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+  38   Thread 0x7ff8725fd000 (LWP 184069) "strata"          syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+  39   Thread 0x7ff871dfc000 (LWP 184070) "strata"          syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+  40   Thread 0x7ff8715fb000 (LWP 184071) "strata"          syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+  41   Thread 0x7ff870dfa000 (LWP 184072) "strata"          syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+  42   Thread 0x7ff855fff000 (LWP 184073) "strata"          syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+  43   Thread 0x7ff8557fe000 (LWP 184074) "strata"          syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+  44   Thread 0x7ff854ffd000 (LWP 184075) "strata"          syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+  45   Thread 0x7ff81ffff000 (LWP 184076) "strata"          syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+  46   Thread 0x7ff81f7fe000 (LWP 184077) "strata"          syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+  47   Thread 0x7ff81effd000 (LWP 184078) "strata"          syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+* 48   Thread 0x7ff801fff000 (LWP 184079) "strata"          __pthread_kill_implementation (no_tid=0, signo=6, threadid=140703162167296) at ./nptl/pthread_kill.c:44
+
+Thread 48 (Thread 0x7ff801fff000 (LWP 184079) "strata"):
+#0  __pthread_kill_implementation (no_tid=0, signo=6, threadid=140703162167296) at ./nptl/pthread_kill.c:44
+#1  __pthread_kill_internal (signo=6, threadid=140703162167296) at ./nptl/pthread_kill.c:78
+#2  __GI___pthread_kill (threadid=140703162167296, signo=signo@entry=6) at ./nptl/pthread_kill.c:89
+#3  0x00007ffff0c42476 in __GI_raise (sig=sig@entry=6) at ../sysdeps/posix/raise.c:26
+#4  0x00007ffff0c287f3 in __GI_abort () at ./stdlib/abort.c:79
+#5  0x00007ffff0c2871b in __assert_fail_base (fmt=0x7ffff0ddd150 "%s%s%s:%u: %s%sAssertion `%s' failed.\n%n", assertion=0x7ffff0dd9599 "mutex->__data.__owner == 0", file=0x7ffff0dd956e "pthread_mutex_lock.c", line=130, function=<optimized out>) at ./assert/assert.c:94
+#6  0x00007ffff0c39e96 in __GI___assert_fail (assertion=assertion@entry=0x7ffff0dd9599 "mutex->__data.__owner == 0", file=file@entry=0x7ffff0dd956e "pthread_mutex_lock.c", line=line@entry=130, function=function@entry=0x7ffff0de1870 <__PRETTY_FUNCTION__.0> "___pthread_mutex_lock") at ./assert/assert.c:103
+#7  0x00007ffff0c9814d in ___pthread_mutex_lock (mutex=<optimized out>) at ./nptl/pthread_mutex_lock.c:130
+#8  0x00007ffff7c41dd4 in ?? () from /usr/local/cuda/lib64/libcudart.so.12
+#9  0x00007ffff7c4408b in ?? () from /usr/local/cuda/lib64/libcudart.so.12
+#10 0x00007ffff7c1410c in ?? () from /usr/local/cuda/lib64/libcudart.so.12
+#11 0x00007ffff7c7d173 in cudaLaunchKernel () from /usr/local/cuda/lib64/libcudart.so.12
+
+Thread 47 (Thread 0x7ff81effd000 (LWP 184078) "strata"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000555555687aa5 in strata::kernels::cpu::ExpertPool::worker(int) ()
+#2  0x00007ffff10dc253 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 46 (Thread 0x7ff81f7fe000 (LWP 184077) "strata"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000555555687aa5 in strata::kernels::cpu::ExpertPool::worker(int) ()
+#2  0x00007ffff10dc253 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 45 (Thread 0x7ff81ffff000 (LWP 184076) "strata"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000555555687aa5 in strata::kernels::cpu::ExpertPool::worker(int) ()
+#2  0x00007ffff10dc253 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 44 (Thread 0x7ff854ffd000 (LWP 184075) "strata"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000555555687aa5 in strata::kernels::cpu::ExpertPool::worker(int) ()
+#2  0x00007ffff10dc253 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 43 (Thread 0x7ff8557fe000 (LWP 184074) "strata"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000555555687aa5 in strata::kernels::cpu::ExpertPool::worker(int) ()
+#2  0x00007ffff10dc253 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 42 (Thread 0x7ff855fff000 (LWP 184073) "strata"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000555555687aa5 in strata::kernels::cpu::ExpertPool::worker(int) ()
+#2  0x00007ffff10dc253 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 41 (Thread 0x7ff870dfa000 (LWP 184072) "strata"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000555555687aa5 in strata::kernels::cpu::ExpertPool::worker(int) ()
+#2  0x00007ffff10dc253 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 40 (Thread 0x7ff8715fb000 (LWP 184071) "strata"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000555555687aa5 in strata::kernels::cpu::ExpertPool::worker(int) ()
+#2  0x00007ffff10dc253 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 39 (Thread 0x7ff871dfc000 (LWP 184070) "strata"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000555555687aa5 in strata::kernels::cpu::ExpertPool::worker(int) ()
+#2  0x00007ffff10dc253 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 38 (Thread 0x7ff8725fd000 (LWP 184069) "strata"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000555555687aa5 in strata::kernels::cpu::ExpertPool::worker(int) ()
+#2  0x00007ffff10dc253 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 37 (Thread 0x7ff872dfe000 (LWP 184068) "strata"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000555555687aa5 in strata::kernels::cpu::ExpertPool::worker(int) ()
+#2  0x00007ffff10dc253 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 36 (Thread 0x7ff875056000 (LWP 184067) "strata"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000555555687aa5 in strata::kernels::cpu::ExpertPool::worker(int) ()
+#2  0x00007ffff10dc253 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 35 (Thread 0x7ff875857000 (LWP 184066) "strata"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000555555687aa5 in strata::kernels::cpu::ExpertPool::worker(int) ()
+#2  0x00007ffff10dc253 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 34 (Thread 0x7ff876058000 (LWP 184065) "strata"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000555555687aa5 in strata::kernels::cpu::ExpertPool::worker(int) ()
+#2  0x00007ffff10dc253 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 33 (Thread 0x7ff876859000 (LWP 184064) "strata"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000555555687aa5 in strata::kernels::cpu::ExpertPool::worker(int) ()
+#2  0x00007ffff10dc253 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 32 (Thread 0x7ff87705a000 (LWP 184063) "strata"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000555555687aa5 in strata::kernels::cpu::ExpertPool::worker(int) ()
+#2  0x00007ffff10dc253 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 31 (Thread 0x7ff87785b000 (LWP 184062) "strata"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000555555687aa5 in strata::kernels::cpu::ExpertPool::worker(int) ()
+#2  0x00007ffff10dc253 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 30 (Thread 0x7ff87805c000 (LWP 184061) "strata"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000555555687aa5 in strata::kernels::cpu::ExpertPool::worker(int) ()
+#2  0x00007ffff10dc253 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 29 (Thread 0x7ff87960b000 (LWP 184060) "strata"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000555555687aa5 in strata::kernels::cpu::ExpertPool::worker(int) ()
+#2  0x00007ffff10dc253 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 28 (Thread 0x7fffb89ff000 (LWP 184059) "strata"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000555555687aa5 in strata::kernels::cpu::ExpertPool::worker(int) ()
+#2  0x00007ffff10dc253 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 27 (Thread 0x7ff8735ff000 (LWP 184058) "strata"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000555555687aa5 in strata::kernels::cpu::ExpertPool::worker(int) ()
+#2  0x00007ffff10dc253 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 26 (Thread 0x7ff873e00000 (LWP 184057) "strata"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000555555687aa5 in strata::kernels::cpu::ExpertPool::worker(int) ()
+#2  0x00007ffff10dc253 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 25 (Thread 0x7ff874601000 (LWP 184056) "strata"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000555555687aa5 in strata::kernels::cpu::ExpertPool::worker(int) ()
+#2  0x00007ffff10dc253 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 24 (Thread 0x7ff87885d000 (LWP 184055) "strata"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000555555687aa5 in strata::kernels::cpu::ExpertPool::worker(int) ()
+#2  0x00007ffff10dc253 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 3 (Thread 0x7ff668dde000 (LWP 183930) "cuda-EvtHandlr"):
+#0  0x00007ffff0d18d1f in __GI___poll (fds=0x7ff664000cf0, nfds=15, timeout=100) at ../sysdeps/unix/sysv/linux/poll.c:29
+#1  0x00007fffb8d19fa7 in ?? () from /lib/x86_64-linux-gnu/libcuda.so.1
+#2  0x00007fffb8e069e7 in ?? () from /lib/x86_64-linux-gnu/libcuda.so.1
+#3  0x00007fffb8d06de3 in ?? () from /lib/x86_64-linux-gnu/libcuda.so.1
+#4  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#5  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 2 (Thread 0x7ff6751ff000 (LWP 183929) "cuda00001800007"):
+#0  0x00007ffff0d18d1f in __GI___poll (fds=0x55555673ca70, nfds=3, timeout=-1) at ../sysdeps/unix/sysv/linux/poll.c:29
+#1  0x00007fffb8d19fa7 in ?? () from /lib/x86_64-linux-gnu/libcuda.so.1
+#2  0x00007fffb8e069e7 in ?? () from /lib/x86_64-linux-gnu/libcuda.so.1
+#3  0x00007fffb8d06de3 in ?? () from /lib/x86_64-linux-gnu/libcuda.so.1
+#4  0x00007ffff0c94a83 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#5  0x00007ffff0d268e0 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 1 (Thread 0x7ffff7bd8000 (LWP 183905) "strata"):
+#0  0x00007ffff19081ff in ?? () from /usr/local/cuda/lib64/libcublas.so.12
+#1  0x00007ffff190889d in ?? () from /usr/local/cuda/lib64/libcublas.so.12
+#2  0x00007ffff190b1b9 in ?? () from /usr/local/cuda/lib64/libcublas.so.12
+#3  0x00007ffff190cffa in ?? () from /usr/local/cuda/lib64/libcublas.so.12
+#4  0x00007ffff18fef1e in ?? () from /usr/local/cuda/lib64/libcublas.so.12
+#5  0x00007ffff190059d in ?? () from /usr/local/cuda/lib64/libcublas.so.12
+#6  0x00007ffff0c45a56 in __cxa_finalize (d=0x7ffff7a336c0) at ./stdlib/cxa_finalize.c:83
+#7  0x00007ffff1466347 in ?? () from /usr/local/cuda/lib64/libcublas.so.12
+#8  0x00007fffffff4ef0 in ?? ()
+#9  0x00007ffff7fc924e in _dl_fini () at ./elf/dl-fini.c:142
+Backtrace stopped: frame did not save the PC

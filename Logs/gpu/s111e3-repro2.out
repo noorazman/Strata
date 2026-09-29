@@ -1,0 +1,12 @@
+strata generate: this CPU has no AVX-512: the expert kernels run on AVX2
+strata generate: native pack: packs/swift-iq3_xxs experts (largest blob 2.33 MB), token embedding type 21 in mapped host memory (260 MiB)
+strata generate: 1466 MiB of weights loaded from packs/swift-iq3_xxs (302 canonical tensors skipped: served natively)
+strata generate: 300 native projection matrices, 1781.11 MiB of weights
+strata generate: PLE ram: preloaded 320001536 rows (26.82 GiB) in 61.08 s (0.44 GiB/s); RAM-resident for the whole run
+strata generate: PLE on, table 320001536 rows of /mnt/ssd/llm_models/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf (PLE I/O mode: ram)
+strata experts: arena first-touch pinned to node 0 (default: the host thread's node (Stage 1.6))
+strata generate: expert arena: cudaHostRegister PORTABLE ok; MAP_HUGETLB unavailable (no hugetlb pool configured?); using 4 KB pages
+strata generate: loaded 39.97 GiB at 1.16 GiB/s
+strata mtp: draft layer loaded, 800 MiB of VRAM (experts 675, dense 111)
+strata mtp: prefill overlap ON (chunk-sized graph for 2048 tokens, captured in background)
+timeout: the monitored command dumped core

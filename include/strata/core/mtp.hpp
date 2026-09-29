@@ -66,8 +66,27 @@ public:
     double ms_draft = 0, ms_prefill = 0;
     int64_t rounds = 0;
 
+    /// Stage 1.11 E3 (opt-in, STRATA_MTP_OVERLAP=1): run the per-chunk-boundary prompt K/V build as one
+    /// chunk-sized CUDA graph on the drafter stream so it overlaps the next chunk's main-model prefill,
+    /// instead of 512 host-synchronized max_t_ sub-chunks. `chunk` is the engine prefill chunk (the
+    /// per-boundary n). Call after load(). The chunk graph is captured synchronously (host-side stream
+    /// capture only) at the next bind(), when the main thread is quiescent and no other thread launches
+    /// kernels; a boundary whose exact n was not captured is captured lazily or falls back to the
+    /// normal per-sub-chunk path.
+    void set_overlap(int64_t chunk);
+    // The main-model compute stream (the prefill's m.cs).  With overlap on, the boundary's D2D of the
+    // chunk's R rows is issued on THIS stream (the one that owns R_rows and rewrites it for the next
+    // chunk, so in-stream order the copy finishes before the rewrite) and the chunk graph on the
+    // drafter stream waits for the copy via an event.  Only used when overlap is active; a no-op call
+    // otherwise.
+    void set_main_stream(cudaStream_t cs) { main_cs_ = cs; }
+    bool overlap_active() const { return ov_chunk_ > 0; }
+
 private:
-    bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err);
+    bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err, const int32_t* tok_base = nullptr,
+                        const int32_t* step_base = nullptr, const int32_t* pos_base = nullptr,
+                        const float* rin_base = nullptr);
+    bool capture_chunk_graph(int64_t n, std::string& err);
     bool capture_prefill(int T, std::string& err);
     bool capture_round(int T, std::string& err);
     bool capture_step(int j, std::string& err);
@@ -110,6 +129,16 @@ private:
     int64_t window_ = 0;        // attention over the last window_ cells (0 = every cell)
     int64_t prompt_len_ = 0;
     float* probs_ = nullptr;
+    // Stage 1.11 E3: chunk-sized prefill overlap (see set_overlap)
+    int64_t ov_chunk_ = 0;
+    float* ov_rin_ = nullptr;             // device: the chunk's R rows, one D2D before the chunk graph
+    cudaStream_t ov_cs_ = nullptr;        // capture-only stream (the capture never touches cs_)
+    cudaStream_t main_cs_ = nullptr;      // the main-model compute stream (prefill's m.cs); see set_main_stream
+    cudaEvent_t ov_ev_ = nullptr;         // completion of the last launched chunk graph (buffer safety)
+    cudaEvent_t ov_copy_ev_ = nullptr;    // marks the boundary's R-rows D2D on main_cs (the graph waits on it)
+    bool ov_ev_valid_ = false;
+    bool ov_capture_done_ = false;        // the synchronous capture of the chunk-sized graph finished
+    std::vector<std::pair<int64_t, cudaGraphExec_t>> ov_execs_;   // n -> chunk graph
     // device
     int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *row_ = nullptr, *ident_ = nullptr;
     float *Rin_ = nullptr, *R_ = nullptr, *emb_ = nullptr, *en_ = nullptr, *e2_ = nullptr, *hn_ = nullptr, *h2_ = nullptr;

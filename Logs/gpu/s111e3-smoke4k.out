@@ -1,0 +1,2 @@
+[bench] s111e3-smoke4k: gpu0 free 13468 MiB; ok
+[bench] s111e3-smoke4k: rc=139 wall=1159.3s decode=- tok/s (? tok / ? ms) prefill=- tok/s TTFT=- ms peakVRAM=23284 MiB cpuMean=7.1% peakGPU=100%
