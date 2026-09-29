@@ -1,0 +1,7 @@
+usage: bench.py [-h] [--gpu GPU] [--workers WORKERS] [--max-new MAX_NEW]
+                [--max-context MAX_CONTEXT] [--kv {fp16,int8}]
+                [--tokens-file TOKENS_FILE] [--tokens TOKENS] [--stats]
+                [--no-samplers] [--timeout TIMEOUT]
+                [--strata-flags STRATA_FLAGS] [--env ENV]
+                label
+bench.py: error: argument --max-context: invalid int value: '4096 8192 16384 32768 65536 131072 262144'

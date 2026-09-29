@@ -35,6 +35,7 @@
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/qsa.hpp"
+#include "strata/kernels/kv_q8.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
@@ -854,6 +855,30 @@ int main(int argc, char** argv) {
     if (strata::core::session_init(g, o.max_context, K, sbuf, ss) == 0) {
         std::fprintf(stderr, "strata generate: session_init failed\n");
         return 1;
+    }
+
+    // Stage 1.10 (opt-in, STRATA_TTFT=1, default off): the session capacity report.  One line at startup:
+    // what the configured context allocates, and where the context-dependent bytes live (the QSA KV cache
+    // covers only the n_qsa_layers() full-attention layers; the GDN layers carry fixed-size recurrent state).
+    const bool ttft = std::getenv("STRATA_TTFT") != nullptr && std::getenv("STRATA_TTFT")[0] != '0';
+    if (ttft) {
+        const strata::kernels::QsaShapes qs = strata::kernels::qsa_real_shapes();
+        const uint64_t kv_tok = o.kv == "int8"
+            ? strata::kernels::kv_q8_bytes_per_cell(qs)
+            : (uint64_t) qs.n_head_kv * qs.head_dim * 2 * 2;
+        std::fprintf(stderr,
+                     "strata ttft config: {\"max_context\": %lld, \"kv\": \"%s\", \"qsa_layers\": %lld, "
+                     "\"gdn_layers\": %lld, \"kv_bytes_per_token\": %llu, "
+                     "\"kv_cache_capacity_bytes\": %llu, \"session_bytes\": %llu, "
+                     "\"qsa_state_bytes_first\": %llu, \"qsa_state_bytes_rest\": %llu, "
+                     "\"qsa_buffers_bytes\": %llu}\n",
+                     (long long) o.max_context, o.kv.c_str(), (long long) g.n_qsa_layers(),
+                     (long long) g.n_gdn_layers(), (unsigned long long) kv_tok,
+                     (unsigned long long) (kv_tok * (uint64_t) o.max_context * (uint64_t) g.n_qsa_layers()),
+                     (unsigned long long) strata::core::session_bytes(g, o.max_context, K),
+                     (unsigned long long) strata::core::qsa_state_bytes(g, o.max_context, true),
+                     (unsigned long long) strata::core::qsa_state_bytes(g, o.max_context, false),
+                     (unsigned long long) strata::core::qsa_buffers_bytes(g, o.max_context));
     }
 
     // ---- **THE HALF-LEVEL DUMP HAS TO BE ARMED BEFORE `session_capture`, AND THE LADDER MUST NOT BE.**  The
@@ -1946,6 +1971,9 @@ int main(int argc, char** argv) {
                 std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>\n");
                 continue;
             }
+            // Stage 1.10 (opt-in, STRATA_TTFT=1): the engine-side request clock.  t_arr is the instant the
+            // engine sees the request line; the later timestamps are relative to it (see the serve ttft line).
+            const Clock::time_point t_arr = Clock::now();
             char* endp = nullptr;
             const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
             std::string emb_path;
@@ -1961,6 +1989,7 @@ int main(int argc, char** argv) {
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
+            const Clock::time_point t_parsed = Clock::now();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
             if (geni || !mrope_identity) {
                 // positions for every cell this request can reach; the identity again for a text request
@@ -2057,11 +2086,13 @@ int main(int argc, char** argv) {
                     }
                 cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
             }
+            const Clock::time_point t_prefill_start = Clock::now();
             if (n > 1 && !sp.run(ids.data(), n - 1, 0, err)) {
                 std::fprintf(stderr, "strata serve: %s\n", err.c_str());
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+            const Clock::time_point t_prefill_end = Clock::now();
             for (const auto& [i, slot] : lent_now) {
                 const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
                 if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
@@ -2073,6 +2104,7 @@ int main(int argc, char** argv) {
             }
             if (!lent_now.empty())
                 cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+            const Clock::time_point t_ready = Clock::now();   // lent slots refilled: prefill fully done
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
             // the verify windows: the first holds the last prompt token alone
             int64_t p = n - 1;
@@ -2083,6 +2115,8 @@ int main(int argc, char** argv) {
             int64_t produced_n = 0;
             const char* finish = "length";
             const Clock::time_point d0 = Clock::now();
+            Clock::time_point t_firstwin{}, t_first_tok{}, t_first_out{};
+            bool ttft_first_done = false;
             while (produced_n < max_new) {
                 int T = S;
                 if (o.spec_min_p > 0.0) {
@@ -2091,6 +2125,7 @@ int main(int argc, char** argv) {
                 }
                 if (first_window) T = 1;
                 if (p + T > o.max_context) break;
+                if (ttft && first_window) t_firstwin = Clock::now();
                 window[0] = x;
                 for (int i = 1; i < T; ++i) window[(size_t) i] = drafts[(size_t) i - 1];
                 drive.d.layers = 0;
@@ -2112,6 +2147,7 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+                if (ttft && first_window) t_first_tok = Clock::now();   // the first token is generated here
                 first_window = false;
                 bool eos = false;
                 for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
@@ -2120,6 +2156,7 @@ int main(int argc, char** argv) {
                     eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
                 }
                 std::fflush(stdout);
+                if (ttft && !ttft_first_done) { t_first_out = Clock::now(); ttft_first_done = true; }
                 ++rounds;
                 const bool drafted = eos || produced_n >= max_new ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
@@ -2137,6 +2174,27 @@ int main(int argc, char** argv) {
                 p += a + 1;
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
+            if (ttft) {
+                // Stage 1.10: the engine-side TTFT stage report, one line per request, relative to t_arr in us.
+                // Stages: request arrival (0) -> parse -> [session reset/borrow] -> prefill start -> prefill end
+                // -> [lent-slot refill] -> first verify window -> first token generated -> first T flushed.
+                const auto us = [&t_arr](const Clock::time_point& tp) {
+                    return (long long) std::chrono::duration_cast<std::chrono::microseconds>(tp - t_arr).count();
+                };
+                const strata::prefill::PrefillStats& ps = sp.stats();
+                std::fprintf(stderr,
+                             "strata serve ttft: {\"prompt_tokens\": %lld, \"max_new\": %lld, \"t_parse_us\": %lld, "
+                             "\"t_prefill_start_us\": %lld, \"t_prefill_end_us\": %lld, \"t_ready_us\": %lld, "
+                             "\"t_first_window_us\": %lld, \"t_first_token_us\": %lld, \"t_first_token_out_us\": %lld, "
+                             "\"generated\": %lld, \"t_done_us\": %lld, \"prefill_chunks\": %lld, \"prefill_ms\": %.1f, "
+                             "\"prefill_ple_ms\": %.1f, \"experts_streamed\": %lld, \"experts_dma\": %lld, "
+                             "\"experts_resident\": %lld, \"experts_host_ms\": %.1f}\n",
+                             (long long) n, (long long) max_new, us(t_parsed), us(t_prefill_start), us(t_prefill_end),
+                             us(t_ready), us(t_firstwin), us(t_first_tok), us(t_first_out), (long long) produced_n,
+                             us(Clock::now()), (long long) ps.chunks, ps.ms_total, ps.ms_ple,
+                             (long long) ps.experts_streamed, (long long) ps.experts_dma, (long long) ps.experts_resident,
+                             ps.ms_experts_host);
+            }
             std::printf("DONE %lld %lld %.1f %.1f %s\n", (long long) produced_n, (long long) n, prompt_ms, decode_ms,
                         finish);
             std::fflush(stdout);

@@ -856,6 +856,14 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             }
         }
     }
+    // Stage 1.10: announce the opt-in wait-fence diagnostic (the kernel reads STRATA_WAIT_FENCE once and
+    // caches it; =1 is the 1024-iteration period from the Stage 1.9 recommendation).
+    if (std::getenv("STRATA_WAIT_FENCE") != nullptr) {
+        const long v = std::atol(std::getenv("STRATA_WAIT_FENCE"));
+        std::fprintf(stderr, "strata verify: STRATA_WAIT_FENCE=on (fence every %llu poll iterations inside "
+                              "wait_flag_ge; opt-in diagnostic, default off)\n",
+                     (unsigned long long) (v <= 0 ? 0 : (v == 1 ? 1024 : (unsigned long) v)));
+    }
     if (!capture(T, err) || !capture_commit(err)) return false;
     VDBG("captured; staging\n");
     const Clock::time_point t0 = Clock::now();

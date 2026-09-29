@@ -2,6 +2,67 @@
 
 Important historical changes and decisions. No raw logs.
 
+## 2026 — V100 Stage 1.10 (branch `stage1.3-expert-pool-sync`, GPU0 only)
+
+Prefill / TTFT / long-context investigation (measurement stage; opt-in instrumentation
+only — default decode/prefill behavior unchanged, proven by the gates below). Question:
+why does the client wait before the first thinking token, and can Strata realistically
+support up to 262K context. **Verdict: the wait is ~98 % GPU prefill (~460 tok/s,
+linear in prompt length); the flag-A visibility lag is a decode-round phenomenon
+(0 prefill waits) and is negligible for TTFT; 262K context is demonstrated — peak
+22,604 MiB on 32,768 MiB with 10.1 GiB headroom, no OOM, stable decode.**
+
+- **TTFT decomposition (new `STRATA_TTFT` instrumentation, engine + server + client).**
+  32K client TTFT 73.2–73.7 s (thinking off/on) = 71.1 s prefill (459–463 tok/s) +
+  2.3 s client HTTP/Python-tokenize + 162 ms constant expert-slot refill + 25 ms first
+  window + <5 ms session reset (≤ 4.1 ms even at 32K) + 15 µs pipe flush. Linear 4K→32K
+  (13.2/21.8/39.6/73.7 s; slope 2.17 ms/tok); measured to 262K (675.8 s, 392 tok/s).
+  Cold first request after start: 36 tok/s prefill while the expert cache fills (69.7 %
+  GPU hits) — a separate startup effect, not the steady-state delay.
+- **Prefill bottleneck (nsys 16K serve capture, `--cuda-event-trace=false`).** 89 % GPU
+  busy; 190 GB of expert weights H2D during the prefill (~18 s of DMA overlapped);
+  dequant 29 % of kernel time, dense GEMM 25 %, fused expert compute 10.7 %, QSA chunk
+  attention 8.2 %, GDN recurrence 4.2 %. The ~450 tok/s ceiling is
+  streaming+dequant-bound; the 450→392 tok/s dip at 262K is QSA long-context chunk work.
+- **Flag-A phase attribution (`s110_trace.py`, serve + generate captures).** 0
+  `wait_flag_ge` waits in prefill (the prefill path is wait-flag-free by construction);
+  round-0 (first token) A ≈ 5.5–6.4 ms of a ~25 ms first window; steady decode carries
+  the Stage 1.9 round-head A (20/20 rounds >1 ms, mean 9.37 ms at 16K; 111/111 mean 9.53
+  ms on the s19 256-tok workload). Answer to "does flag-A affect TTFT": ~0.006 % of 32K
+  TTFT — it is a decode-round-latency problem.
+- **`STRATA_WAIT_FENCE` A/B (new, opt-in; off by default).** Periodic
+  `__threadfence_system()` (every 1024 polls by default) inside the `wait_flag_ge` spin
+  loop. e2e: fp16/8192 50.46→50.06 tok/s (−0.8 %), int8/32768 49.07→49.26 (+0.4 %) —
+  within noise, bit-identical output (golden `c1517d…` / int8 ref `cdb7f7…`). Kernel
+  level: round-head A mean −10 % (9.53→8.54 ms), max −28 % (14.63→10.45 ms), total wait
+  −4.2 % (1,672→1,602 ms); the fence removes the visibility-lag TAIL, not its mean body
+  (window-boundary effect). Decision: keep opt-in as a diagnostic/tail-latency knob; do
+  not make it the default.
+- **Long-context sweep 4K→262K (int8 KV, fresh engine per context).** Peak VRAM
+  18,736/18,800/18,926/19,178/19,668/20,646/**22,604 MiB**; no OOM, no CUDA errors, no
+  hangs at any size. 262K: int8 KV 3.09 GiB (12,672 B/token × 262,144 across the 12 QSA
+  layers), session 3.92 GiB, ~10.1 GiB headroom; 32K→262K growth (3,426 MiB) matches
+  KV+RoPE(64 MiB)+idx. Arithmetic: 524K ≈ 26.2 GiB (feasible, untested), 1M ≈ 33.5 GiB
+  (not feasible) → **max practical context = 262,144 (demonstrated)**; the bounding
+  memory component is the QSA int8 KV cache. Steady decode: 48.9–57.1 tok/s to 128K,
+  46.8–54.8 at 262K — no systematic context penalty (GDN state context-independent; QSA
+  sparse with selection capped at 32,768 cells).
+- **Determinism (per completed config).** 32/32 golden prefix + 256/256 byte-identical
+  (md5 `cdb7f7d056f339ba704d3bb9620a1dec`, the int8/32768 reference) on fresh engines at
+  ALL 7 contexts; fill-prompt 256-tok fresh-engine pairs IDENTICAL at 32K and 262K;
+  shared-engine fill r1/r2 diverge (expert-cache residency — the pre-existing
+  GPU-hit-path caveat). Phase F both arms bit-identical. All rc=0.
+- **Tooling / artifacts.** `bench/v100/s110_client.py` (per-SSE-line TTFT client),
+  `s110.sh` (ttft/ctx/ctxgate/fence), `s110nsys.sh`, `s110_trace.py` (prefill/round-0/
+  decode wait attribution), `s110_summary.py`, `s110_sweep.sh`, `corpus-265k.ids`
+  (262,987-token BPE corpus; exact-N cuts round-trip); `bench.py --tokens-file` passed
+  through natively (argv strings cap at 128 KB). Quirks logged: NSYS 2025.1.3
+  device-side event trace stalls on prefill `cudaEventRecord` (use
+  `--cuda-event-trace=false`); `PrefillStats.ms_total` accumulates across requests.
+- **Next (Stage 1.11, not started).** (a) prefill expert-streaming/dequant overlap or
+  persistent dequantized hot experts (the TTFT long pole); (b) round-head flag-A
+  structural fix (~2,400 µs/tok theoretical headroom, Stage 1.9).
+
 ## 2026 — V100 Stage 1.9 (branch `stage1.3-expert-pool-sync`, GPU0 only)
 
 `wait_flag_ge` A/B/C dependency analysis (profile-only stage, no engine changes; binary

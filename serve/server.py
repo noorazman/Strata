@@ -43,6 +43,34 @@ IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
 
 
+def _ttft_on() -> bool:
+    """Stage 1.10 opt-in: per-request TTFT stage timing.  OFF by default; with STRATA_TTFT set (and != 0)
+    the server prints one JSON line per request to stderr with the HTTP-side stages (arrival, JSON parse,
+    tokenize/prepare, GEN write to the engine, first engine token, first SSE byte, first reasoning/content
+    byte, completion), all relative to request arrival in ms.  The engine, started with the same env,
+    prints its own stage line (parse/ingest/prefill/first-window/first-token) to its log; the two join on
+    the per-request wall clock.  Adds no per-request work when off."""
+    return os.environ.get("STRATA_TTFT", "0") not in ("", "0")
+
+
+def _ttft_report(tt: dict) -> None:
+    """One JSON line to stderr: every stage relative to request arrival, in ms (None = not reached)."""
+    if not tt:
+        return
+    t0 = tt.pop("t0", None)
+    if t0 is None:
+        return
+    for k in ("t_json", "t_prepare", "t_gen_write", "t_first_engine_tok", "t_first_sse",
+              "t_first_reasoning", "t_first_content", "t_done"):
+        v = tt.pop(k, None)
+        tt[k + "_ms"] = round((v - t0) * 1000.0, 3) if v is not None else None
+    for k in list(tt):
+        if tt[k] is None:
+            tt.pop(k)
+    sys.stderr.write("strata serve ttft: " + json.dumps(tt, separators=(",", ":")) + "\n")
+    sys.stderr.flush()
+
+
 # ------------------------------------------------------------------------------------------------ engines
 class Engine(Protocol):
     max_context: int
@@ -79,6 +107,7 @@ class StrataEngine:
                                      stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
         self.max_context = 0
         self.last = {}
+        self.ttft: dict = {}     # the current request's stage timestamps (the service's FIFO serializes requests)
         for line in self.proc.stdout:
             if line.startswith("READY"):
                 self.max_context = int(line.split()[1])
@@ -88,12 +117,19 @@ class StrataEngine:
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         head = f"GENI {int(max_new)} {embeddings}" if embeddings else f"GEN {int(max_new)}"
+        # Stage 1.10: the GEN line is written (and flushed) when the generator is first advanced, which is
+        # when the request handler has finished tokenizing; this is the t_gen_write mark.
         self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
         self.proc.stdin.flush()
+        if self.ttft:
+            self.ttft["t_gen_write"] = time.perf_counter()
+            self.ttft["n_ids"] = len(ids)
         done = False
         try:
             for line in self.proc.stdout:
                 if line.startswith("T "):
+                    if "t_first_engine_tok" not in self.ttft and self.ttft:
+                        self.ttft["t_first_engine_tok"] = time.perf_counter()
                     if not cancel.is_set():
                         yield int(line[2:])
                 elif line.startswith("DONE"):
@@ -495,15 +531,22 @@ def make_handler(svc: Service):
         def do_POST(self):
             if not self._authorized():
                 return
+            tt = {"t0": time.perf_counter(), "endpoint": self.path.split("?")[0]} if _ttft_on() else None
             try:
                 req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+                if tt:
+                    tt["t_json"] = time.perf_counter()
                 if self.path.rstrip("/") == "/v1/chat/completions":
-                    self._openai(req)
+                    self._openai(req, tt)
                 elif self.path.rstrip("/") == "/v1/messages":
-                    self._anthropic(req)
+                    self._anthropic(req, tt)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except ValueError as e:
+                if tt:
+                    tt["error"] = str(e)
+                    tt["t_done"] = time.perf_counter()
+                    _ttft_report(tt)
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
 
         def _sse(self):
@@ -512,39 +555,85 @@ def make_handler(svc: Service):
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
 
-        def _openai(self, req):
+        def _openai(self, req, tt=None):
             messages, tools, kw = openai_to_messages(req)
             max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 1024)
             ids, thinking = svc.prepare(messages, tools, kw, max_new)
+            if tt:
+                tt["t_prepare"] = time.perf_counter()
+                tt["prompt_tokens"] = len(ids)
+                tt["thinking"] = thinking
+                tt["max_new"] = max_new
+                tt["stream"] = bool(req.get("stream"))
             cancel = threading.Event()
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel)
+            if tt:
+                svc.engine.ttft = tt
             if not req.get("stream"):
-                return self._json(200, openai_collect(chunks))
+                self._json(200, openai_collect(chunks))
+                if tt:
+                    tt["t_done"] = time.perf_counter()
+                    _ttft_report(tt)
+                return
             self._sse()
+            if tt:
+                tt["t_first_sse"] = time.perf_counter()
             try:
                 for c in chunks:
                     self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
                     self.wfile.flush()
+                    if tt:
+                        d = c["choices"][0]["delta"]
+                        if d.get("reasoning_content") and "t_first_reasoning" not in tt:
+                            tt["t_first_reasoning"] = time.perf_counter()
+                        if d.get("content") and "t_first_content" not in tt:
+                            tt["t_first_content"] = time.perf_counter()
                 self.wfile.write(b"data: [DONE]\n\n")
             except OSError:
                 cancel.set()                                 # client went away: stop at the next step
+            if tt:
+                tt["t_done"] = time.perf_counter()
+                _ttft_report(tt)
 
-        def _anthropic(self, req):
+        def _anthropic(self, req, tt=None):
             messages, tools, kw = anthropic_to_messages(req)
             max_new = int(req.get("max_tokens") or 1024)
             ids, thinking = svc.prepare(messages, tools, kw, max_new)
+            if tt:
+                tt["t_prepare"] = time.perf_counter()
+                tt["prompt_tokens"] = len(ids)
+                tt["thinking"] = thinking
+                tt["max_new"] = max_new
+                tt["stream"] = bool(req.get("stream"))
             cancel = threading.Event()
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
+            if tt:
+                svc.engine.ttft = tt
             if not req.get("stream"):
-                return self._json(200, anthropic_collect(events))
+                self._json(200, anthropic_collect(events))
+                if tt:
+                    tt["t_done"] = time.perf_counter()
+                    _ttft_report(tt)
+                return
             self._sse()
+            if tt:
+                tt["t_first_sse"] = time.perf_counter()
             try:
                 for name, e in events:
                     self.wfile.write(f"event: {name}\n".encode() + b"data: " +
                                      json.dumps(e, ensure_ascii=False).encode() + b"\n\n")
                     self.wfile.flush()
+                    if tt and name == "content_block_delta":
+                        d = e.get("delta", {})
+                        if d.get("type") == "thinking_delta" and "t_first_reasoning" not in tt:
+                            tt["t_first_reasoning"] = time.perf_counter()
+                        if d.get("type") == "text_delta" and "t_first_content" not in tt:
+                            tt["t_first_content"] = time.perf_counter()
             except OSError:
                 cancel.set()
+            if tt:
+                tt["t_done"] = time.perf_counter()
+                _ttft_report(tt)
 
     return Handler
 

@@ -1,0 +1,7 @@
+[bench] s110-fill262144-det1: gpu0 free 32764 MiB; ok
+[bench] s110-fill262144-det1: rc=0 wall=778.8s decode=41.36 tok/s (256 tok / 6189.2 ms) prefill=392.19 tok/s TTFT=667908.1 ms peakVRAM=22582 MiB cpuMean=5.9% peakGPU=100%
+[bench]   cache hits 79582/130887 = 60.8% (admitted 0, refused 51305, 100.0% full)
+[bench]   spec: 75 rounds x 4, accepted 181/216 (0.838), 3.41 tok/round; mtp draft 3.655 ms/round
+[bench]   PLE RAM: 26.82 GiB resident, preloaded in 14.2 s (1.89 GiB/s); served 4193888 rows (377.4 MB) from RAM
+[bench]   pool 33.21 ms/tok (drain 0.0, re-park 0.0, wait 0.0)
+[bench]   output: 37119 13 63847 321 6414 3000 41139 3808 279 2919 430 279 3177 13569 59489 685 ... (256 tokens)

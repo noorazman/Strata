@@ -415,19 +415,41 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 }
 
 namespace {
-__global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value, uint64_t* iters) {
+// Stage 1.10 (opt-in, STRATA_WAIT_FENCE, default OFF): when `fence_period > 0`, issue a
+// `__threadfence_system()` every `fence_period` poll iterations INSIDE the spin loop (today the kernel
+// fences only once, after the loop exits).  This is the direct test of the Stage 1.9 "stale mapped-flag
+// line on the GPU read path at the window boundary" hypothesis: if the GPU read path is caching the stale
+// line, a system-scope fence during polling forces a re-fetch and the round-head flag-A spin should
+// collapse; if not, the distribution is unchanged and the cost is one fence per `fence_period` spins.
+// `fence_period == 0` (the default, env unset) leaves the loop bit-identical to the pre-1.10 kernel.
+__global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value, uint64_t* iters,
+                                    uint64_t fence_period) {
     uint64_t n = 0;
     while (*flag < value) {
         __nanosleep(100);
         ++n;
+        if (fence_period > 0 && (n % fence_period) == 0) __threadfence_system();
     }
     if (iters) *iters = n;   // Stage 1.6 probe: how many poll iterations the wait took
     __threadfence_system();
 }
 }  // namespace
 
+// Read once, then cached: STRATA_WAIT_FENCE unset or 0 -> off; =1 -> the Stage 1.10 diagnostic period of
+// 1024 poll iterations; any other positive value -> that explicit period.
+static uint64_t wait_fence_period() {
+    static const uint64_t period = [] {
+        const char* e = std::getenv("STRATA_WAIT_FENCE");
+        if (e == nullptr) return (uint64_t) 0;
+        const long v = std::atol(e);
+        if (v <= 0) return (uint64_t) 0;
+        return v == 1 ? (uint64_t) 1024 : (uint64_t) v;
+    }();
+    return period;
+}
+
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream, uint64_t* iters) {
-    wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, iters);
+    wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, iters, wait_fence_period());
     check("wait_flag_ge");
 }
 

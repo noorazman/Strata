@@ -410,12 +410,15 @@ def main():
     if not (a.tokens or a.tokens_file):
         a.tokens = ("9419,11,821,803,369,7967,13,353,1044,264,11952,5617,303,220,17,"
                     "15,17,21,13,10875,353,668,3184,488,883,821,1118,1834,13")
+    # Long prompts: pass --tokens-file straight to the engine (native file read) instead of a
+    # --tokens command argument (MAX_ARG_STRLEN = 128 KB caps a single argv string).
+    tok_arg = f"--tokens-file {a.tokens_file}" if a.tokens_file else f"--tokens {a.tokens}"
     if a.tokens_file:
         a.tokens = open(a.tokens_file).read().strip()
 
     tail = (f"--expert-cache auto --prefill 2048 --spec 4 --spec-min-p 0.5 "
             f"--pool-workers {a.workers} --mtp mtp/rt --max-context {a.max_context} "
-            f"--kv {a.kv} --max-new {a.max_new} --tokens {a.tokens}")
+            f"--kv {a.kv} --max-new {a.max_new} {tok_arg}")
     if a.stats:
         tail += " --stats"
     if a.strata_flags:

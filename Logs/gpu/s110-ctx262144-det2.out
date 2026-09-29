@@ -1,0 +1,7 @@
+[bench] s110-ctx262144-det2: gpu0 free 32764 MiB; ok
+[bench] s110-ctx262144-det2: rc=0 wall=116.3s decode=49.41 tok/s (256 tok / 5181.3 ms) prefill=15.3 tok/s TTFT=2081.6 ms peakVRAM=22604 MiB cpuMean=5.9% peakGPU=100%
+[bench]   cache hits 130449/156452 = 83.4% (admitted 0, refused 26003, 100.0% full)
+[bench]   spec: 112 rounds x 4, accepted 144/218 (0.661), 2.29 tok/round; mtp draft 1.977 ms/round
+[bench]   PLE RAM: 26.82 GiB resident, preloaded in 18.85 s (1.42 GiB/s); served 5728 rows (0.5 MB) from RAM
+[bench]   pool 12.26 ms/tok (drain 0.0, re-park 0.0, wait 0.0)
+[bench]   output: 271 248068 198 760 1156 369 30869 5402 430 328 23202 1288 264 11952 5617 303 ... (256 tokens)
