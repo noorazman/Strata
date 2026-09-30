@@ -188,6 +188,7 @@ if(STRATA_ENABLE_CUDA)
                           src/kernels/cuda/qsa_select.cu
                           src/kernels/cuda/verify_kernels.cu
                           src/kernels/cuda/iq_kernels.cu
+                          src/kernels/cuda/moe_fused.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)

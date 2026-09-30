@@ -1,0 +1,7 @@
+[bench] s112e5-g16384-det1: gpu0 free 32640 MiB; ok
+[bench] s112e5-g16384-det1: rc=0 wall=119.8s decode=49.92 tok/s (256 tok / 5128.0 ms) prefill=13.02 tok/s TTFT=2293.3 ms peakVRAM=19050 MiB cpuMean=5.1% peakGPU=100%
+[bench]   cache hits 141220/164354 = 85.9% (admitted 0, refused 23134, 100.0% full)
+[bench]   spec: 109 rounds x 4, accepted 147/237 (0.62), 2.35 tok/round; mtp draft 2.066 ms/round
+[bench]   PLE RAM: 26.82 GiB resident, preloaded in 16.78 s (1.6 GiB/s); served 5984 rows (0.5 MB) from RAM
+[bench]   pool 12.10 ms/tok (drain 0.0, re-park 0.0, wait 0.0)
+[bench]   output: 271 248068 198 760 1156 369 30869 5402 430 328 23202 1288 264 11952 5617 303 ... (256 tokens)

@@ -7,6 +7,7 @@
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/ple.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/moe_fused.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
@@ -107,6 +108,14 @@ struct Prefill::Impl {
     // Stage 1.11 E7 (opt-in, STRATA_TWO_STREAM_DMA=1): a second copy stream; the staging ring's slots
     // alternate streams so one CE waiting on a slot's GEMM-freed event does not idle the other.
     bool two_stream = false;
+    // Stage 1.12 diagnostic (opt-in, STRATA_MOE_ROUTE_DUMP=<path>): appends the routed expert set
+    // per (chunk, MoE layer) so the cross-chunk re-streaming redundancy of the ~170 GB expert H2D
+    // can be measured offline.  Pure logging; the routing math and the GPU path are untouched.
+    std::FILE* route_dump = nullptr;
+    // Stage 1.12 E5 (opt-in, STRATA_MOE_DEQUANT_GEMM_FUSE=1): replace the per-expert
+    // [dequant_gu/dequant_f16 -> f16 weight buffer -> cuBLAS GEMM] pair with the fused
+    // dequant+GEMM kernels (moe_fused.cu).  The staging, residency, swiglu and combine are unchanged.
+    bool moe_fuse = false;
     uint16_t* dq_gu[DQ] = {};
     uint16_t* dq_d[DQ] = {};
     uint8_t* stage_dev[STAGE] = {};
@@ -138,6 +147,7 @@ Prefill::~Prefill() {
     }
     if (impl_->copy) cudaStreamDestroy(impl_->copy);
     if (impl_->copy2) cudaStreamDestroy(impl_->copy2);
+    if (impl_->route_dump) std::fclose(impl_->route_dump);
     for (void* p : impl_->owned) cudaFree(p);
 }
 
@@ -162,6 +172,30 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     if (const char* e7 = std::getenv("STRATA_TWO_STREAM_DMA"); e7 && std::string(e7) == "1") {
         if (cudaStreamCreateWithFlags(&m.copy2, cudaStreamNonBlocking) != cudaSuccess) { err = "prefill: second copy stream"; return false; }
         m.two_stream = true;
+    }
+    // Stage 1.12 diagnostic: STRATA_MOE_ROUTE_DUMP=<path> appends "<chunk> <layer> <n> <e1> <e2> ..."
+    // lines (the routed expert set of every MoE section) for the offline H2D-redundancy analysis.
+    if (const char* rd = std::getenv("STRATA_MOE_ROUTE_DUMP"); rd && *rd) {
+        m.route_dump = std::fopen(rd, "a");
+        if (m.route_dump) std::fprintf(m.route_dump, "# stage1.12 route dump: chunk layer count experts...\n");
+    }
+    // Stage 1.12 diagnostic: STRATA_EXPERT_FMT_DUMP=1 prints the native pack's per-layer expert
+    // format (quant types, offsets, blob size) to stderr - the E5 prototype's ground truth.
+    if (const char* fd = std::getenv("STRATA_EXPERT_FMT_DUMP"); fd && std::string(fd) == "1") {
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            const auto& f = lay.fmt[(size_t) l];
+            std::fprintf(stderr, "expert-fmt l%lld: gu_type %d d_type %d n_ff %lld n_embd %lld up_off %zu "
+                                  "down_off %zu blob %zu\n",
+                         (long long) l, f.gu_type, f.d_type, (long long) f.n_ff, (long long) f.n_embd,
+                         f.up_off, f.down_off, lay.blob_bytes((int64_t) l));
+        }
+    }
+    // Stage 1.12 E5 (opt-in): fuse the per-expert dequant + GEMM.  The dequant kernels and the cuBLAS
+    // expert GEMMs are replaced by the fused kernels in moe_fused.cu; everything else (staging ring,
+    // residency, swiglu, combine) is untouched.  Default off.
+    if (const char* e5 = std::getenv("STRATA_MOE_DEQUANT_GEMM_FUSE"); e5 && std::string(e5) == "1") {
+        m.moe_fuse = true;
     }
     const size_t T = (size_t) chunk;
     bool ok = true;
@@ -491,6 +525,13 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         if (e < 0 || e >= NE) { err = "prefill: routed id out of range"; return false; }
                         ++m.cnt[(size_t) e];
                     }
+                    if (m.route_dump) {
+                        int64_t nr = 0;
+                        for (int64_t e = 0; e < NE; ++e) nr += (m.cnt[(size_t) e] > 0);
+                        std::fprintf(m.route_dump, "%ld %ld %lld", (long) stats_.chunks, (long) l, (long long) nr);
+                        for (int64_t e = 0; e < NE; ++e) if (m.cnt[(size_t) e] > 0) std::fprintf(m.route_dump, " %lld", (long long) e);
+                        std::fputc('\n', m.route_dump);
+                    }
                     m.off[0] = 0;
                     for (int64_t e = 0; e < NE; ++e) m.off[(size_t) e + 1] = m.off[(size_t) e] + m.cnt[(size_t) e];
                     std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
@@ -556,20 +597,34 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             blob_dev = m.stage_dev[stage_of[j]];
                         }
                         const int q = (int) (j % DQ);
-                        if (lay.native) {
-                            // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
-                            const auto& f = lay.fmt[(size_t) l];
-                            strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
-                                                               m.dq_gu[q], m.cs);
-                            strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs);
-                        } else {
-                            blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);
-                        }
-                        if (stage_of[j] >= 0) cudaEventRecord(m.used[stage_of[j]], m.cs);
                         const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
-                        m.gemm.f16(m.Xs + o0 * N, m.dq_gu[q], m.GU + o0 * 1280, ne, 1280, N);
+                        if (lay.native && m.moe_fuse) {
+                            // Stage 1.12 E5 (opt-in): dequant + GEMM in one kernel - no dq_gu/dq_d round trip.
+                            const auto& f = lay.fmt[(size_t) l];
+                            strata::kernels::moe_fused_gemm_gu(f.gu_type, blob_dev, blob_dev + f.up_off, ne, f.n_ff,
+                                                               f.n_embd, m.Xs + o0 * N, N, m.GU + o0 * 1280, 1280, m.cs);
+                        } else {
+                            if (lay.native) {
+                                // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
+                                const auto& f = lay.fmt[(size_t) l];
+                                strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
+                                                                   m.dq_gu[q], m.cs);
+                                strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs);
+                            } else {
+                                blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);
+                            }
+                            if (stage_of[j] >= 0) cudaEventRecord(m.used[stage_of[j]], m.cs);
+                            m.gemm.f16(m.Xs + o0 * N, m.dq_gu[q], m.GU + o0 * 1280, ne, 1280, N);
+                        }
                         swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
-                        m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
+                        if (lay.native && m.moe_fuse) {
+                            const auto& f = lay.fmt[(size_t) l];
+                            strata::kernels::moe_fused_gemm_d(f.d_type, blob_dev + f.down_off, ne, f.n_ff, f.n_embd,
+                                                              m.Hh + o0 * 640, 640, m.Dm + o0 * N, N, m.cs);
+                            if (stage_of[j] >= 0) cudaEventRecord(m.used[stage_of[j]], m.cs);
+                        } else {
+                            m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
+                        }
                     }
                     moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
                 }

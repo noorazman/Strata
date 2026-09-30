@@ -2,6 +2,76 @@
 
 Important historical changes and decisions. No raw logs.
 
+## 2026 — V100 Stage 1.12 (branch `stage1.3-expert-pool-sync`, GPU0 only)
+
+MoE prefill: (1) H2D byte-volume diagnostic of the ~170 GB expert-weight stream, and (2) E5 —
+an opt-in fused dequant + expert GEMM. **Verdict: the 16 K prefill streams 169.70 GB of expert
+weights (96,650 transfers @ 10.57 GB/s) = 133,176 routed slots over only 20,716 unique
+(layer, expert) pairs (6.43× re-routing); the 8,000-slot profile cache is 27.4 % resident and
+the profile itself is under-optimized (static top-C 48.06 % @8 K → 91.35 % @16 K vs 27.4 %
+measured); ~14 K slots fit in the ~12.7 GB VRAM headroom → ~83 % hit → ~76 % byte cut = the
+separate opt-in candidate E8 (not combined with E5). E5 (fused wmma dequant+GEMM) is
+correct and deterministic but ~1.8× slower on prefill (the GU-path dequant loses its standalone
+parallelism inside the GEMM CTA); per the stage stop rule it stays opt-in, default OFF, and the
+32 K production config is unchanged.**
+
+- **H2D byte-volume diagnostic (measurement only, no code change).** The ~170 GB figure from
+  Stage 1.11 is confirmed and decomposed: 169.70 GB in 96,650 H2D transfers on the main-expert
+  stream at 10.57 GB/s active (10.36 MB/token, 3.535 GB per MoE layer). Routing (route dump of
+  the real 16 K prefill) shows 133,176 routed expert slots collapsing to 20,716 unique
+  (layer, expert) pairs — 6.43× re-routing, the redundancy. The 8,000-pair profile cache is only
+  27.4 % resident on this workload; LRU hit-rate has a phase transition at 18 K (→ 82.65 %), and a
+  static top-C analysis (48.06 % @8 K → 91.35 % @16 K) shows the *profile* is under-optimized
+  rather than the cache size being the limit. Transfer size is not the lever (67–437 MB
+  transfers run only 3.0–4.4 GB/s). VRAM headroom ~12.7 GB → ~14 K resident slots → ~83 % hit →
+  170 → ~40 GB (~76 % cut). Recorded as the separate opt-in candidate **E8**, deliberately not
+  combined with E5 in the first A/B.
+- **E5 `STRATA_MOE_DEQUANT_GEMM_FUSE=1` (default OFF)** (`src/kernels/cuda/moe_fused.cu`,
+  `include/strata/kernels/moe_fused.hpp`, `include/strata/kernels/moe_fused_iq.hpp`,
+  `src/prefill/prefill.cpp`, `CMakeLists.txt`): two fused wmma kernels (32×32 tile, 128 threads /
+  4 warps, 16×16 f16-in / f32-accumulate, K-strips of 256 for GU / a single 640 strip for D)
+  replace the per-expert (dequant + cuBLAS GEMM) pairs; the dequantizer is transcribed
+  value-by-value from `iq_kernels.cu` so it is **bit-identical** to the separate path for all 7
+  quant types (proven by `bench/v100/e5_dequant_parity.cu`, exact kernel addressing incl. the GU
+  row-interleave).
+- **E5 bring-up bug (sm_70 NVVM frontend).** The epilogue originally staged the 16×16 f32
+  accumulator tile in a local `float buf[16*16]`; the sm_70 frontend (CUDA 12.9, NVVM 7.0.1)
+  eliminated the entire `wmma::store_matrix_sync` + masked float4 copy chain from the PTX and
+  left a bare `trap` on the live path — first gate run died with a sticky "unspecified launch
+  failure" and SASS showed 0 HMMA / 0 STG. Bisect (unmasked: still dropped; no `__restrict__`:
+  still dropped; `buf` in shared: survives) isolated the local tile; the fix stages the tile in
+  this warp's slice of the already-allocated `__shared__ __half ws` (reused after the last
+  stripe barrier). Verified by re-disassembly: all 7 instantiations carry their HMMA chains
+  (256 GU / 640 D) + 64 float4 stores and no `BPT.TRAP`.
+- **Correctness (fresh-engine gates, int8 KV, production flags, 16 K + 32 K):** 32/32
+  golden-prefix MATCH; 256×2 byte-identical (md5 `aaff1a3f…` on both runs/contexts —
+  deterministic, but last-ULP-different from the OFF reference `cdb7f7d0…` because the GEMM
+  K-association order differs from cuBLAS's internal tiling; per the stage rule this is
+  documented and E5 stays opt-in, not default-enabled); decode 49.92/49.04 tok/s (target
+  49–50); no CUDA errors/hangs.
+- **A/B (fresh-engine serve runs):** TTFT 16 K **72.98 vs 40.89 s (1.78×)**, 32 K **141.64 vs
+  77.43 s (1.83×)**; decode unchanged (50.77/49.88 vs 50.66/49.45 tok/s — E5 touches prefill
+  only). nsys: the fused path takes **50.85 s** of kernel time where the OFF pair (dequant 10.37 s
+  + expert GEMM ~2.3 s) does the same work in ~12.7 s; H2D unchanged (170.3 vs 169.7 GB — no DMA
+  touched); launch count 1.30 M → 0.90 M.
+- **Root cause (microbenchmark `e5_microbench.cu` + kernel decomposition).** The GU fusion is
+  2.3× slower per expert (fused GU 200 µs vs OFF pair 87 µs at T=8): the dequant pass is 85 % of
+  the fused GU kernel (186 µs vs 57 µs standalone) because it loses its parallelism — the
+  standalone `dequant_gu_kernel` runs 12,800 blocks × 32 threads = 409,600 threads, while the
+  fused kernel's dequant runs in only 40 CTAs × 128 threads (the 32-weight-row GEMM tile pins the
+  CTA count) and at ne ≈ 6.6 the skinny GEMM can't amortize the moved dequant. The D fusion
+  WINS (37 vs 49 µs = 0.73–0.75×). Net expert total 1.74× — matching the wall-clock regression.
+  Next-stage fusion options: GU split-K with a fixed-order partial-sum reduce, a
+  16-weight-row / 2-warp-m tile, or D-only fusion; E8 is the bigger lever.
+- **Tooling (additive, `bench/v100/`):** `s112e5.sh` (gate + A/B harness), `s112nsys.sh`
+  (nsys capture of the E5 16 K prefill), `s112nsys_analyze.py` (OFF-vs-E5 kernel/H2D comparison;
+  handles the nsys `StringIds` FK name table + ns timestamps), `e5_dequant_parity.cu`,
+  `e5_microbench.cu`. Data: `Logs/gpu/s112routedump-16k.txt`, `s112nsys-16k-e5.sqlite`
+  (force-added, like the 1.11 OFF capture), `Logs/{benchmarks,cpu,gpu}/s112e5-*`.
+- **Production state:** all experimental flags OFF (`STRATA_MOE_DEQUANT_GEMM_FUSE=0` default;
+  E3/E4/E7 OFF), 32 K / int8 / port 8180 config unchanged, `strata.service` restarted and
+  verified live (`/health` + a live request).
+
 ## 2026 — V100 Stage 1.11 (branch `stage1.3-expert-pool-sync`, GPU0 only)
 
 Prefill / TTFT optimization: profile → identify the largest real bottleneck → make ONE
