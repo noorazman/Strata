@@ -2,6 +2,39 @@
 
 Important historical changes and decisions. No raw logs.
 
+## 2026 — V100 Stage 1.13 (branch `stage1.3-expert-pool-sync`, GPU0 only)
+
+MoE prefill H2D byte-reduction by growing the resident expert cache (E8). **Verdict: per-16K-prefill
+expert H2D falls 169.70 → 62.00 GB (−63.5 %) at a TTFT of −5.4 % (16 K) / −4.3 % (32 K); the modest
+wall gain is because the MoE prefill is compute-bound (dequant+GEMM unchanged — resident experts
+still run the same kernels, only their DMA is saved). E8 is opt-in; the 8,000-slot production
+default is unchanged (VRAM margin ~12.7 → ~3.5 GB at 32 K) and `strata.service` is restored +
+verified live.**
+
+- **E8 = `--expert-cache 14000 --expert-profile data/expert-profile-14k.bin` (opt-in, no engine
+  code change).** The existing sized-slot mechanism walks the profile in rank order up to the VRAM
+  cap; all 14,000 pairs fit (22.78 GiB of the 26.61 GiB free). `--expert-cache auto` is capped at
+  the profile's pair count, so the larger profile file is the second half of the lever. The
+  prefill's slot borrow takes only the ~70 lowest-ranked slots (<0.5 % of the profile).
+- **The rebuilt profile is the real fix.** The shipped 8,000-pair `data/expert-profile.bin` is only
+  27.4 % execution-resident on the 16 K fill workload (stale routing distribution). `data/expert-profile-14k.bin`
+  (sha256 `f5d6561c…ad7`) is the token-count-weighted top-14,000 of the real 16 K + 32 K fill
+  routing (47.85 M decisions, 22,113 unique pairs; in-sample decision coverage 98.54 % at 14 K,
+  execution coverage 77.6 %/78.9 % on the two workloads), built by `bench/v100/e8_profile.py` from
+  the new per-expert-count route dumps (2-line diagnostic extension to `STRATA_MOE_ROUTE_DUMP` in
+  `src/prefill/prefill.cpp`).
+- **Measured (nsys, same-build A/B):** stream-15 expert H2D 169.70 → 62.00 GB (96,650 → 34,534
+  transfers); prefill window 35.88 → 33.87 s; total kernel time 32,515.6 → 32,028.5 ms (dequant
+  launches unchanged ~133 K — residency saves DMA only); +10.57 GB one-time startup arena prefill.
+  Serve A/B: 16 K TTFT 40.56 → 38.36 s, hit 28.5 → 72.0 %, streamed runs −60.8 %; 32 K TTFT
+  76.57 → 73.29 s, hit 28.0 → 73.0 %, streamed −62.5 %, cumulative prefill_ms −4.2 %.
+- **Gates:** 256×2 byte-identical at 16 K and 32 K (md5 `3dffc779e10a20ff295609ecc182d3be`), 32-tok
+  run = exact prefix of det1, decode 48.51/48.01 tok/s, no CUDA errors. The old 8,000-slot golden
+  diverges at token 6 (expected: E8 changes the decode hit-path residency set; the ROUND 328
+  hit-path numerics are residency-sensitive — documented, E8 stays opt-in).
+- **Tooling:** `bench/v100/{s113e8.sh, e8_profile.py, s113nsys.sh, s113nsys-off.sh}`, route dumps
+  `Logs/gpu/s113route-{16k,32k}.txt`. Doc: `Docs/v100-stage1.13-final.md`.
+
 ## 2026 — V100 Stage 1.12 (branch `stage1.3-expert-pool-sync`, GPU0 only)
 
 MoE prefill: (1) H2D byte-volume diagnostic of the ~170 GB expert-weight stream, and (2) E5 —

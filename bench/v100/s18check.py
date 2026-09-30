@@ -42,7 +42,7 @@ def main():
                     print(f"  first divergence at token {i}: run={a} golden={b}")
                     break
         return
-    if len(sys.argv) == 3 and sys.argv[1] == "--diff":
+    if len(sys.argv) == 4 and sys.argv[1] == "--diff":
         a, b = toks_of(sys.argv[2]), toks_of(sys.argv[3])
         if a == b:
             print(f"{sys.argv[2]} == {sys.argv[3]} (byte-identical, n={len(a)})")

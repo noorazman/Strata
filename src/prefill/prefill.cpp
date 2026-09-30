@@ -173,8 +173,9 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         if (cudaStreamCreateWithFlags(&m.copy2, cudaStreamNonBlocking) != cudaSuccess) { err = "prefill: second copy stream"; return false; }
         m.two_stream = true;
     }
-    // Stage 1.12 diagnostic: STRATA_MOE_ROUTE_DUMP=<path> appends "<chunk> <layer> <n> <e1> <e2> ..."
-    // lines (the routed expert set of every MoE section) for the offline H2D-redundancy analysis.
+    // Stage 1.12 diagnostic / Stage 1.13 E8: STRATA_MOE_ROUTE_DUMP=<path> appends
+    // "<chunk> <layer> <n> <e1> <c1> ..." lines (the routed expert set WITH per-expert token counts,
+    // for every MoE section) for the offline H2D-redundancy / profile-ranking analysis.
     if (const char* rd = std::getenv("STRATA_MOE_ROUTE_DUMP"); rd && *rd) {
         m.route_dump = std::fopen(rd, "a");
         if (m.route_dump) std::fprintf(m.route_dump, "# stage1.12 route dump: chunk layer count experts...\n");
@@ -526,10 +527,15 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         ++m.cnt[(size_t) e];
                     }
                     if (m.route_dump) {
+                        // Stage 1.13 E8: the dump is now "<chunk> <layer> <nr> <e1> <c1> <e2> <c2> ..."
+                        // (per-expert token counts, not just the routed set) so an offline profile can be
+                        // ranked by routing FREQUENCY rather than set membership.  The Stage 1.12 dumps
+                        // carry the bare set; the builder (bench/v100/e8_profile.py) accepts both.
                         int64_t nr = 0;
                         for (int64_t e = 0; e < NE; ++e) nr += (m.cnt[(size_t) e] > 0);
                         std::fprintf(m.route_dump, "%ld %ld %lld", (long) stats_.chunks, (long) l, (long long) nr);
-                        for (int64_t e = 0; e < NE; ++e) if (m.cnt[(size_t) e] > 0) std::fprintf(m.route_dump, " %lld", (long long) e);
+                        for (int64_t e = 0; e < NE; ++e) if (m.cnt[(size_t) e] > 0)
+                            std::fprintf(m.route_dump, " %lld %lld", (long long) e, (long long) m.cnt[(size_t) e]);
                         std::fputc('\n', m.route_dump);
                     }
                     m.off[0] = 0;
