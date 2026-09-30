@@ -34,6 +34,14 @@ void iq_embed_rows(int ggml_type, const void* table, size_t row_bytes, const int
 void iq_dequant_gu_f16(int ggml_type, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst,
                        void* stream);
 
+/// Stage 1.14 opt-in wide-memory-op variants of the dequant kernels above (STRATA_MOE_DQ_WIDE=1).  Bit-identical
+/// to the baseline kernels (wide table loads + 16 B stores, same per-value math/evaluation order).  Types without
+/// a wide implementation transparently launch the baseline kernel, so these are drop-in replacements.
+bool iq_wide_supported(int ggml_type) noexcept;
+void iq_dequant_f16_wide(int ggml_type, const void* src, int64_t n, uint16_t* dst, void* stream);
+void iq_dequant_gu_f16_wide(int ggml_type, const void* gate, const void* up, int64_t n_ff, int64_t n_embd,
+                            uint16_t* dst, void* stream);
+
 /// The layout of one native expert blob: [gate rows | up rows | down rows], raw GGUF blocks.
 struct NativeExpertLayout {
     int gu_type = -1, d_type = -1;

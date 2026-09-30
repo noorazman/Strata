@@ -1,0 +1,7 @@
+[bench] s114g16k-off-g32: gpu0 free 32648 MiB; ok
+[bench] s114g16k-off-g32: rc=0 wall=178.4s decode=41.0 tok/s (32 tok / 780.4 ms) prefill=15.27 tok/s TTFT=2186.4 ms peakVRAM=19020 MiB cpuMean=3.1% peakGPU=100%
+[bench]   cache hits 12277/17688 = 69.4% (admitted 0, refused 5411, 100.0% full)
+[bench]   spec: 12 rounds x 4, accepted 20/26 (0.769), 2.67 tok/round; mtp draft 2.155 ms/round
+[bench]   PLE RAM: 26.82 GiB resident, preloaded in 22.91 s (1.17 GiB/s); served 1056 rows (0.1 MB) from RAM
+[bench]   pool 25.70 ms/tok (drain 0.0, re-park 0.0, wait 0.0)
+[bench]   output: 271 248068 198 760 1156 369 30869 5402 430 328 23202 1288 264 11952 5617 303 ... (32 tokens)

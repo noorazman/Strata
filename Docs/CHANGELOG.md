@@ -2,6 +2,39 @@
 
 Important historical changes and decisions. No raw logs.
 
+## 2026 — V100 Stage 1.14 (branch `stage1.3-expert-pool-sync`, GPU0 only)
+
+MoE prefill dequant speedup via wide memory ops (`STRATA_MOE_DQ_WIDE=1`, opt-in, default OFF).
+**Verdict: PASS — the MoE expert dequant (the largest non-GEMM prefill kernel) is L1/TEX-pipe
+bound; one isolated change (wide table loads + 16-byte stores, bit-identical math) halves it:
+dequant kernel time −49.6 % (16 K) / −49.7 % (32 K) = TTFT −6.7 % (16 K) / −8.0 % (32 K), decode
+unchanged, H2D unchanged. Opt-in; the production 32 K / int8 / 8 K-cache config is restored and
+verified live (flag off).**
+
+- **Root cause (ncu):** baseline `dequant_gu_kernel` is L1/TEX-pipe bound (L1 77 %, DRAM 17 %,
+  SM 9 %, 72.3 cycles/inst); SASS issues 8 × `LDG.E.U8` (byte-per-grid-entry) + 8 × `STG.E.U16`
+  (half-per-element) per thread. The dequantizer is limited by the L1 pipe, not bandwidth.
+- **The change:** read each codebook grid entry with one `LDG.64`/`LDG.32` (the grids are
+  `__device__` `uint64_t[]`/`uint32_t[]`), read the 1-byte tables via 4-byte sub-offsets, and
+  pack the 8 output halves into one `STG.128`. Per-value math and evaluation order are the
+  baseline's verbatim → **bit-identical f16 output**. `wide_gu` 55.6 → 31.1 µs (ncu: L1 77 → 69 %,
+  DRAM 17 → 28 %, cycles/inst 72.3 → 29.5); D flat −1.8…−2.9×. GU PER=1, flat PER=2 (microbench
+  optimum). 3 bit-identity bugs found & fixed (type 16 aux8 byte, type 21 qh-shift cast,
+  type 42 output mapping).
+- **Measured (nsys same-build A/B):** dequant 9,563.7 → 4,821.1 ms (16 K), 19,238.4 → 9,685.0 ms
+  (32 K); total kernel time −14.2 % / −14.1 %; prefill window −3.11 s / −5.69 s; H2D unchanged
+  (169.70 / 339.65 GB). Serve A/B (r1): 16 K TTFT 40.44 → 37.72 s, 32 K 77.54 → 71.36 s; decode
+  51.6 → 51.3 / 49.4 → 48.7 tok/s (unchanged).
+- **Gates (fresh engines, int8 KV, 16 K + 32 K):** 32-tok golden MATCH (OFF+ON); 256×2
+  det1==det2 (OFF+ON); OFF det == ON det byte-identical (md5 `cdb7f7d056f3…`); serve fill-prompt
+  OFF r1 == ON r1 byte-identical (16 K `6041c5f3…`, 32 K `1fbe577e…`); no CUDA errors.
+- **Implementation:** `src/kernels/cuda/iq_kernels.cu` (wide dequantizers + kernels + launchers;
+  types without a wide impl fall back to the baseline kernel in-launcher),
+  `include/strata/kernels/iq_kernels.hpp`, `src/prefill/prefill.cpp` (flag + dispatch).
+- **Documented-not-done:** the wide GU still plateaus ≈2× above the 15.4 µs memory roofline
+  (L1 69 % + 50 %-capped occupancy, 1 warp/block) → a 128-thread / 2+ warps-per-block GU
+  redesign is the follow-up stage. Doc: `Docs/v100-stage1.14-final.md`.
+
 ## 2026 — V100 Stage 1.13 (branch `stage1.3-expert-pool-sync`, GPU0 only)
 
 MoE prefill H2D byte-reduction by growing the resident expert cache (E8). **Verdict: per-16K-prefill

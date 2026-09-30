@@ -116,6 +116,10 @@ struct Prefill::Impl {
     // [dequant_gu/dequant_f16 -> f16 weight buffer -> cuBLAS GEMM] pair with the fused
     // dequant+GEMM kernels (moe_fused.cu).  The staging, residency, swiglu and combine are unchanged.
     bool moe_fuse = false;
+    // Stage 1.14 (opt-in, STRATA_MOE_DQ_WIDE=1): route the native-pack dequant through the
+    // wide-memory-op kernels (iq_dequant_*_wide in iq_kernels.cu).  Bit-identical to the baseline
+    // kernels; types without a wide implementation fall back to the baseline kernel internally.
+    bool moe_dq_wide = false;
     uint16_t* dq_gu[DQ] = {};
     uint16_t* dq_d[DQ] = {};
     uint8_t* stage_dev[STAGE] = {};
@@ -197,6 +201,11 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     // residency, swiglu, combine) is untouched.  Default off.
     if (const char* e5 = std::getenv("STRATA_MOE_DEQUANT_GEMM_FUSE"); e5 && std::string(e5) == "1") {
         m.moe_fuse = true;
+    }
+    // Stage 1.14 (opt-in): wide-memory-op dequant kernels (bit-identical to the baseline).  Orthogonal
+    // to E5: when both are on, E5's fused path wins and this flag is inert for the native layers.
+    if (const char* dw = std::getenv("STRATA_MOE_DQ_WIDE"); dw && std::string(dw) == "1") {
+        m.moe_dq_wide = true;
     }
     const size_t T = (size_t) chunk;
     bool ok = true;
@@ -613,9 +622,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             if (lay.native) {
                                 // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
                                 const auto& f = lay.fmt[(size_t) l];
-                                strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
-                                                                   m.dq_gu[q], m.cs);
-                                strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs);
+                                if (m.moe_dq_wide) {
+                                    // Stage 1.14 (opt-in): wide-memory-op dequant (bit-identical to the baseline).
+                                    strata::kernels::iq_dequant_gu_f16_wide(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
+                                                                             m.dq_gu[q], m.cs);
+                                    strata::kernels::iq_dequant_f16_wide(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs);
+                                } else {
+                                    strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
+                                                                       m.dq_gu[q], m.cs);
+                                    strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs);
+                                }
                             } else {
                                 blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);
                             }

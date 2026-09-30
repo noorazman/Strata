@@ -576,11 +576,219 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
     dq_dispatch<__half>(ty, parity ? up : gate, i, y + ((2 * r + parity) * per_row + c) * QK_K, threadIdx.x);
 }
 
+// ------------------------------------------------------------------
+// Stage 1.14: wide-memory-op dequant kernels (opt-in, STRATA_MOE_DQ_WIDE=1).
+//
+// ncu on the baseline dequant_gu_kernel: L1/TEX-pipe bound (L1 77 %, DRAM 17 %, SM 9 %); the
+// SASS issues 8 x LDG.E.U8 per 8 B grid entry and 8 x STG.E.U16 per thread.  These variants
+// load each table entry with ONE wide load (the grids are uint64_t / uint32_t __device__
+// arrays) and pack the 8 output halves into ONE 16 B store.  The per-value math and
+// evaluation order are the dq_* functions above verbatim, so the f16 output is bit-identical
+// to the baseline kernel (verified bench/v100/s114_wide_kernel_test.cu: all 7 types
+// bit-ident at PER 1 and 2; ncu: dequant_gu 55.6 -> 31.1 us, L1 75 -> 69 %, DRAM 17 -> 28 %).
+//
+// Alignment notes (derived from the block layouts; all block sizes are 2 mod 4):
+//  - table loads: grids are declared uint64_t[] / uint32_t[] (4/8 B aligned) -> safe.
+//  - kmask_iq2xs / kvalues_iq4nl are 1 B-aligned arrays -> bytes read via 4 B sub-offsets.
+//  - in-blob 2 B loads are safe at even in-block byte offsets (4 B/8 B in-blob loads are not).
+// ------------------------------------------------------------------
+__device__ __forceinline__ uint64_t wide_kmask8() {
+    const uintptr_t a = (uintptr_t) kmask_iq2xs;
+    const uint32_t* b = (const uint32_t*) (a & ~3ull);
+    uint64_t m = 0;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const uintptr_t off = a + j;
+        m |= (uint64_t) ((b[(off - (uintptr_t) b) >> 2] >> (8 * (off & 3))) & 0xff) << (8 * j);
+    }
+    return m;
+}
+__device__ __forceinline__ uint8_t wide_kv_byte(int j) {
+    const uintptr_t a = (uintptr_t) kvalues_iq4nl;
+    const uint32_t* b = (const uint32_t*) (a & ~3ull);
+    const uintptr_t off = a + j;
+    return (uint8_t) ((b[(off - (uintptr_t) b) >> 2] >> (8 * (off & 3))) & 0xff);
+}
+__device__ __forceinline__ float wide_sgn(float v, int signs, uint64_t mask, int j) {
+    return signs & (int) (mask >> 8 * j) ? -v : v;
+}
+__device__ __forceinline__ void wide_store8(__half* y, float v[8]) {
+    uint4 p;
+    p.x = (unsigned) __half_as_ushort(__float2half(v[0])) | ((unsigned) __half_as_ushort(__float2half(v[1])) << 16);
+    p.y = (unsigned) __half_as_ushort(__float2half(v[2])) | ((unsigned) __half_as_ushort(__float2half(v[3])) << 16);
+    p.z = (unsigned) __half_as_ushort(__float2half(v[4])) | ((unsigned) __half_as_ushort(__float2half(v[5])) << 16);
+    p.w = (unsigned) __half_as_ushort(__float2half(v[6])) | ((unsigned) __half_as_ushort(__float2half(v[7])) << 16);
+    *(uint4*) (y + 32 * (int) (threadIdx.x & 7) + 8 * (int) (threadIdx.x >> 3)) = p;
+}
+// tid 0..31; ib = tid & 7, il = tid >> 3 (the production mapping).  Each thread writes its 8
+// halves at the production output offset (32*ib + 8*il within the superblock).
+__device__ __forceinline__ void wide_dq_iq2_xxs(const void* vx, int64_t ibs, __half* y, int tid) {
+    const block_iq2_xxs* x = (const block_iq2_xxs*) vx;
+    const int ib = tid & 7, il = tid >> 3;
+    // production grid index: aux8[il] = BYTE il of the 8-byte group at qs + 8*ib bytes, i.e.
+    // (il even) low byte of q2[il/2], else HIGH byte of q2[il/2]  (q2 = uint16 view of qs+4*ib).
+    const uint16_t q2h = x[ibs].qs[4 * ib + (il >> 1)];
+    const uint8_t aux8 = (il & 1) ? (uint8_t) (q2h >> 8) : (uint8_t) q2h;
+    const uint32_t aux32 = (uint32_t) x[ibs].qs[4 * ib + 2] | ((uint32_t) x[ibs].qs[4 * ib + 3] << 16);
+    const float d = (float) x[ibs].d * (0.5f + (aux32 >> 28)) * 0.25f;
+    const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * il) & 127];
+    const uint64_t g64 = iq2xxs_grid[aux8];
+    const uint8_t* gb = (const uint8_t*) &g64;
+    const uint64_t mk = wide_kmask8();
+    float v[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) v[j] = wide_sgn(d * (float) gb[j], signs, mk, j);
+    wide_store8(y, v);
+}
+__device__ __forceinline__ void wide_dq_iq2_xs(const void* vx, int64_t ibs, __half* y, int tid) {
+    const block_iq2_xs* x = (const block_iq2_xs*) vx;
+    const int ib = tid & 7, il = tid >> 3;
+    const uint16_t q2k = x[ibs].qs[4 * ib + il];
+    const float d = (float) x[ibs].d * (0.5f + ((x[ibs].scales[ib] >> 4 * (il / 2)) & 0xf)) * 0.25f;
+    const uint8_t signs = ksigns_iq2xs[q2k >> 9];
+    const uint64_t g64 = iq2xs_grid[q2k & 511];
+    const uint8_t* gb = (const uint8_t*) &g64;
+    const uint64_t mk = wide_kmask8();
+    float v[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) v[j] = wide_sgn(d * (float) gb[j], signs, mk, j);
+    wide_store8(y, v);
+}
+__device__ __forceinline__ void wide_dq_iq3_xxs(const void* vx, int64_t ibs, __half* y, int tid) {
+    const block_iq3_xxs* x = (const block_iq3_xxs*) vx;
+    const int ib = tid & 7, il = tid >> 3;
+    const uint16_t q3p = ((const uint16_t*) x[ibs].qs)[4 * ib + il];
+    const uint16_t* gas16 = (const uint16_t*) (x[ibs].qs + 64);   // block stride is 2 mod 4: 2 B loads
+    const uint32_t gas = (uint32_t) gas16[2 * ib] | ((uint32_t) gas16[2 * ib + 1] << 16);
+    const float d = (float) x[ibs].d * (0.5f + (gas >> 28)) * 0.5f;
+    const uint8_t signs = ksigns_iq2xs[(gas >> 7 * il) & 127];
+    const uint32_t g1 = iq3xxs_grid[(uint8_t) q3p];
+    const uint32_t g2 = iq3xxs_grid[(uint8_t) (q3p >> 8)];
+    const uint8_t* a = (const uint8_t*) &g1, * b = (const uint8_t*) &g2;
+    const uint64_t mk = wide_kmask8();
+    float v[8];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        v[j + 0] = wide_sgn(d * (float) a[j], signs, mk, j + 0);
+        v[j + 4] = wide_sgn(d * (float) b[j], signs, mk, j + 4);
+    }
+    wide_store8(y, v);
+}
+__device__ __forceinline__ void wide_dq_iq3_s(const void* vx, int64_t ibs, __half* y, int tid) {
+    const block_iq3_s* x = (const block_iq3_s*) vx;
+    const int ib = tid & 7, il = tid >> 3;
+    const uint16_t qsp = ((const uint16_t*) x[ibs].qs)[4 * ib + il];
+    const uint8_t qh = x[ibs].qh[ib];
+    const float d = (float) x[ibs].d * (1 + 2 * ((x[ibs].scales[ib / 2] >> 4 * (ib % 2)) & 0xf));
+    const uint8_t signs = x[ibs].signs[4 * ib + il];
+    const uint32_t g1 = iq3s_grid[(uint8_t) qsp | ((qh << (8 - 2 * il)) & 256)];
+    const uint32_t g2 = iq3s_grid[(uint8_t) (qsp >> 8) | ((qh << (7 - 2 * il)) & 256)];
+    const uint8_t* a = (const uint8_t*) &g1, * b = (const uint8_t*) &g2;
+    const uint64_t mk = wide_kmask8();
+    float v[8];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        v[j + 0] = wide_sgn(d * (float) a[j], signs, mk, j + 0);
+        v[j + 4] = wide_sgn(d * (float) b[j], signs, mk, j + 4);
+    }
+    wide_store8(y, v);
+}
+__device__ __forceinline__ void wide_dq_iq2_s(const void* vx, int64_t ibs, __half* y, int tid) {
+    const block_iq2_s* x = (const block_iq2_s*) vx;
+    const int ib = tid & 7, il = tid >> 3;
+    const uint8_t qsb = x[ibs].qs[4 * ib + il];
+    const uint8_t qh = x[ibs].qh[ib];
+    const float d = (float) x[ibs].d * (0.5f + ((x[ibs].scales[ib] >> 4 * (il / 2)) & 0xf)) * 0.25f;
+    const uint8_t signs = x[ibs].qs[QK_K / 8 + 4 * ib + il];
+    const uint64_t g64 = iq2s_grid[(uint32_t) qsb | ((uint32_t) qh << (8 - 2 * il)) & 0x300];
+    const uint8_t* gb = (const uint8_t*) &g64;
+    const uint64_t mk = wide_kmask8();
+    float v[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) v[j] = wide_sgn(d * (float) gb[j], signs, mk, j);
+    wide_store8(y, v);
+}
+__device__ __forceinline__ void wide_dq_iq4_nl(const void* vx, int64_t ibs, __half* y, int tid) {
+    // 32-value blocks; the thread handles 8 values of block ib: 4 low + 4 high nibbles, at
+    // output offsets 32*ib + 4*il (+0..3) and +16 (+0..3) of the superblock.
+    const block_iq4_nl* x = (const block_iq4_nl*) vx + ibs * (QK_K / QK4_NL);
+    const int ib = tid & 7, il = tid >> 3;
+    const uint16_t q01 = ((const uint16_t*) x[ib].qs)[2 * il];
+    const uint16_t q23 = ((const uint16_t*) x[ib].qs)[2 * il + 1];
+    const float d = (float) x[ib].d;
+    const uint32_t q4w = (uint32_t) q01 | ((uint32_t) q23 << 16);   // qs[4il..4il+3]
+    const uint8_t* qb = (const uint8_t*) &q4w;
+    float v[8];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        v[j + 0] = d * (float) ((int8_t) wide_kv_byte((int) qb[j] & 0xf));
+        v[j + 4] = d * (float) ((int8_t) wide_kv_byte((int) qb[j] >> 4));
+    }
+    *(uint2*) (y + 32 * ib + 4 * il) = make_uint2(
+        (unsigned) __half_as_ushort(__float2half(v[0])) | ((unsigned) __half_as_ushort(__float2half(v[1])) << 16),
+        (unsigned) __half_as_ushort(__float2half(v[2])) | ((unsigned) __half_as_ushort(__float2half(v[3])) << 16));
+    *(uint2*) (y + 32 * ib + 4 * il + 16) = make_uint2(
+        (unsigned) __half_as_ushort(__float2half(v[4])) | ((unsigned) __half_as_ushort(__float2half(v[5])) << 16),
+        (unsigned) __half_as_ushort(__float2half(v[6])) | ((unsigned) __half_as_ushort(__float2half(v[7])) << 16));
+}
+__device__ __forceinline__ void wide_dq_q2_0(const void* vx, int64_t ibs, __half* y, int tid) {
+    const block_q2_0* x = (const block_q2_0*) vx + ibs * 4;
+    const int b = tid >> 3, part = tid & 7;
+    const float d = (float) x[b].d;
+    const uint16_t q2 = ((const uint16_t*) x[b].qs)[part];
+    const uint8_t lo = (uint8_t) q2, hi = (uint8_t) (q2 >> 8);
+    float v[8];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        v[j + 0] = d * (float) (((lo >> (2 * j)) & 3) - 1);
+        v[j + 4] = d * (float) (((hi >> (2 * j)) & 3) - 1);
+    }
+    // Q2_0 output mapping differs from the GU mapping: thread writes yy[b*64 + part*8 .. +7]
+    uint4 p;
+    p.x = (unsigned) __half_as_ushort(__float2half(v[0])) | ((unsigned) __half_as_ushort(__float2half(v[1])) << 16);
+    p.y = (unsigned) __half_as_ushort(__float2half(v[2])) | ((unsigned) __half_as_ushort(__float2half(v[3])) << 16);
+    p.z = (unsigned) __half_as_ushort(__float2half(v[4])) | ((unsigned) __half_as_ushort(__float2half(v[5])) << 16);
+    p.w = (unsigned) __half_as_ushort(__float2half(v[6])) | ((unsigned) __half_as_ushort(__float2half(v[7])) << 16);
+    *(uint4*) (y + 64 * b + 8 * part) = p;
+}
+template<int TY> struct wide_sel;
+template<> struct wide_sel<16> { static __device__ void f(const void* v, int64_t i, __half* y, int t) { wide_dq_iq2_xxs(v, i, y, t); } };
+template<> struct wide_sel<17> { static __device__ void f(const void* v, int64_t i, __half* y, int t) { wide_dq_iq2_xs(v, i, y, t); } };
+template<> struct wide_sel<18> { static __device__ void f(const void* v, int64_t i, __half* y, int t) { wide_dq_iq3_xxs(v, i, y, t); } };
+template<> struct wide_sel<20> { static __device__ void f(const void* v, int64_t i, __half* y, int t) { wide_dq_iq4_nl(v, i, y, t); } };
+template<> struct wide_sel<21> { static __device__ void f(const void* v, int64_t i, __half* y, int t) { wide_dq_iq3_s(v, i, y, t); } };
+template<> struct wide_sel<22> { static __device__ void f(const void* v, int64_t i, __half* y, int t) { wide_dq_iq2_s(v, i, y, t); } };
+template<> struct wide_sel<42> { static __device__ void f(const void* v, int64_t i, __half* y, int t) { wide_dq_q2_0(v, i, y, t); } };
+// PER = independent superblocks per thread (memory-level parallelism).
+template<int TY, int PER>
+__global__ void __launch_bounds__(32) wide_gu_kernel(int64_t per_row, const void* __restrict__ gate,
+                                                     const void* __restrict__ up, __half* __restrict__ y) {
+    const int64_t base = (int64_t) blockIdx.x * PER;
+    const int parity = blockIdx.y;
+    const void* vx = parity ? up : gate;
+#pragma unroll
+    for (int p = 0; p < PER; ++p) {
+        const int64_t i = base + p;
+        const int64_t r = i / per_row, c = i % per_row;
+        wide_sel<TY>::f(vx, i, y + ((2 * r + parity) * per_row + c) * QK_K, (int) threadIdx.x);
+    }
+}
+template<int TY, int PER>
+__global__ void __launch_bounds__(32) wide_flat_kernel(const void* __restrict__ vx, __half* __restrict__ y) {
+    const int64_t base = (int64_t) blockIdx.x * PER;
+#pragma unroll
+    for (int p = 0; p < PER; ++p) {
+        const int64_t i = base + p;
+        wide_sel<TY>::f(vx, i, y + i * QK_K, (int) threadIdx.x);
+    }
+}
+
 bool is_iq(int t) { return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11; }
 
 }  // namespace
 
 bool iq_supported(int t) noexcept { return is_iq(t); }
+bool iq_wide_supported(int t) noexcept { return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 42; }
 
 size_t iq_row_bytes(int t, int64_t n) noexcept {
     switch (t) {
@@ -661,6 +869,60 @@ void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, in
     dequant_gu_kernel<<<dim3((unsigned) (n_ff * per_row), 2), 32, 0, (cudaStream_t) stream>>>(t, gate, up, per_row,
                                                                                            (__half*) dst);
     check("iq_dequant_gu_f16");
+}
+
+// Stage 1.14 wide variants (opt-in).  Drop-in replacements: for types without a wide
+// implementation the baseline kernel is launched, so numerics are invariant either way.
+namespace {
+template<int TY, int PER>
+void launch_wide_flat(const void* src, int64_t sb, __half* dst, cudaStream_t s) {
+    wide_flat_kernel<TY, PER><<<(unsigned) (sb / PER), 32, 0, s>>>(src, dst);
+}
+template<int TY, int PER>
+void launch_wide_gu(int64_t per_row, int64_t sb, const void* gate, const void* up, __half* dst, cudaStream_t s) {
+    wide_gu_kernel<TY, PER><<<dim3((unsigned) (sb / PER), 2), 32, 0, s>>>(per_row, gate, up, dst);
+}
+}  // namespace
+
+void iq_dequant_f16_wide(int t, const void* src, int64_t n, uint16_t* dst, void* stream) {
+    if (n % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_f16_wide: bad arguments\n"); std::exit(1); }
+    const int64_t sb = n / 256;
+    const cudaStream_t s = (cudaStream_t) stream;
+    __half* d = (__half*) dst;
+    if (!iq_wide_supported(t)) {
+        dequant_flat_kernel<__half><<<(unsigned) sb, 32, 0, s>>>(t, src, (__half*) dst);
+        check("iq_dequant_f16_wide");
+        return;
+    }
+    const bool per2 = (sb % 2 == 0);
+    switch (t) {
+        case 20: per2 ? launch_wide_flat<20, 2>(src, sb, d, s) : launch_wide_flat<20, 1>(src, sb, d, s); break;
+        case 42: per2 ? launch_wide_flat<42, 2>(src, sb, d, s) : launch_wide_flat<42, 1>(src, sb, d, s); break;
+        default: dequant_flat_kernel<__half><<<(unsigned) sb, 32, 0, s>>>(t, src, (__half*) dst); break;
+    }
+    check("iq_dequant_f16_wide");
+}
+
+void iq_dequant_gu_f16_wide(int t, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst,
+                            void* stream) {
+    const int64_t per_row = n_embd / 256;
+    const int64_t sb = n_ff * per_row;
+    const cudaStream_t s = (cudaStream_t) stream;
+    __half* d = (__half*) dst;
+    if (!iq_wide_supported(t)) {
+        dequant_gu_kernel<<<dim3((unsigned) sb, 2), 32, 0, s>>>(t, gate, up, per_row, (__half*) dst);
+        check("iq_dequant_gu_f16_wide");
+        return;
+    }
+    switch (t) {
+        case 16: launch_wide_gu<16, 1>(per_row, sb, gate, up, d, s); break;
+        case 17: launch_wide_gu<17, 1>(per_row, sb, gate, up, d, s); break;
+        case 18: launch_wide_gu<18, 1>(per_row, sb, gate, up, d, s); break;
+        case 21: launch_wide_gu<21, 1>(per_row, sb, gate, up, d, s); break;
+        case 22: launch_wide_gu<22, 1>(per_row, sb, gate, up, d, s); break;
+        default: dequant_gu_kernel<<<dim3((unsigned) sb, 2), 32, 0, s>>>(t, gate, up, per_row, (__half*) dst); break;
+    }
+    check("iq_dequant_gu_f16_wide");
 }
 
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
