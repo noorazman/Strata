@@ -47,6 +47,10 @@ private:
     int64_t scratch_elems_ = 0;
     void* workspace_ = nullptr;
     bool external_ = false;
+    size_t ws_bytes_ = 0;
+    void* lt_handle_ = nullptr;  // cublasLt handle (Stage 1.15: STRATA_MOE_GEMM_LT)
+    bool use_lt_ = false;        // route f16() through cublasLtMatmul when true
+    bool lt_fail_ = false;       // sticky: fall back to cublasGemmEx after an Lt error
 };
 
 

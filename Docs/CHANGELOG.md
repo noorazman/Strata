@@ -2,6 +2,36 @@
 
 Important historical changes and decisions. No raw logs.
 
+## 2026 — V100 Stage 1.15 (branch `stage1.3-expert-pool-sync`, GPU0 only)
+
+MoE prefill GEMM: cuBLASLt routing (`STRATA_MOE_GEMM_LT=1`, opt-in, default OFF).
+**Verdict: STOP (mission stop rule) — profiled first; the GU expert GEMM is the largest
+actionable MoE prefill component (≈4.3 s @16 K, 40 % of DRAM peak, 15.5 % occupancy, + a
+splitKreduce ≈24 % of the GEMM). The cheapest measured lever — routing `Gemm::f16` through
+`cublasLtMatmul` with a shape-cached first-heuristic algo — wins 2–9 % (GU) / 4–13 % (D) in the
+isolated-kernel microbench but is a WASH end-to-end: 16 K A/B wash, 32 K A/B wash (direction
+flips between runs; averages −0.52 %, inside the noise), and the nsys MoE f16 GEMM family time
+is unchanged (cuBLASLt selects the SAME kernels as the cuBLAS default for the engine's shapes).
+Not a meaningful e2e improvement → stopped and documented, OFF-by-default, production restored.
+A custom f32-FMA kernel family was rejected at ne≥4 (X re-read / smem traffic is the bottleneck,
+not the W read). Reaching the GU roofline needs a tensor-core MMA kernel for the skinny ne≤64
+bulk — the follow-up.**
+
+- **The change:** `Gemm::f16` (the MoE expert GU+D path) optionally routes through
+  `cublasLtMatmul` with the first heuristic algorithm instead of
+  `cublasGemmEx(CUBLAS_GEMM_DEFAULT)`. Per-shape (N,K,T) Lt objects (op / matrix layouts /
+  heuristic) are cached in a static `LtCache` so the hot loop only issues the GEMM; a sticky
+  `lt_fail_` falls back to `cublasGemmEx` on any Lt error. `CMakeLists.txt` links
+  `CUDA::cublasLt` to `strata_prefill`. Default OFF (the env var is read at `Gemm::init`).
+- **Why it didn't land e2e:** the isolated-kernel microbench win (2–9 %) does not translate to
+  the running prefill — the nsys GEMM family total is unchanged (11,901.8 vs 11,931.2 ms) and the
+  kernel names + launch counts are identical, so the algo choice is the same; the GEMM time is
+  dominated by the L2/DRAM state of the running prefill, not the cuBLAS vs cuBLASLt routing.
+- **Gates (wide-ON A/B baseline):** 32-tok golden MATCH (baseline leg); LT-ON byte-identical to
+  the baseline at 32 tok and at the 16 K / 32 K fill-prompt r1 (`6041c5f3…` / `1fbe577e…`),
+  det1==det2 on both legs, no CUDA errors, decode unchanged. A/B: 16 K wash; 32 K wash (run 1
+  −1.47 %, run 2 +0.43 %).
+
 ## 2026 — V100 Stage 1.14 (branch `stage1.3-expert-pool-sync`, GPU0 only)
 
 MoE prefill dequant speedup via wide memory ops (`STRATA_MOE_DQ_WIDE=1`, opt-in, default OFF).
