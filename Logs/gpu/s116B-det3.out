@@ -1,0 +1,7 @@
+[bench] s116B-det3: gpu0 free 32658 MiB; ok
+[bench] s116B-det3: rc=0 wall=132.2s decode=51.4 tok/s (256 tok / 4980.3 ms) prefill=7.83 tok/s TTFT=5259.8 ms peakVRAM=19284 MiB cpuMean=5.4% peakGPU=100%
+[bench]   cache hits 123446/149248 = 82.7% (admitted 0, refused 25802, 100.0% full)
+[bench]   spec: 109 rounds x 4, accepted 147/206 (0.714), 2.35 tok/round; mtp draft 1.942 ms/round
+[bench]   PLE RAM: 26.82 GiB resident, preloaded in 17.42 s (1.54 GiB/s); served 5488 rows (0.5 MB) from RAM
+[bench]   pool 12.67 ms/tok (drain 0.0, re-park 0.0, wait 0.0)
+[bench]   output: 271 248068 198 760 1156 369 30869 5402 430 328 23202 1288 264 11952 5617 303 ... (256 tokens)

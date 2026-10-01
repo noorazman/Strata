@@ -1,0 +1,7 @@
+[bench] s116B-16k-r1: gpu0 free 32658 MiB; ok
+[bench] s116B-16k-r1: rc=0 wall=159.4s decode=36.36 tok/s (64 tok / 1760.3 ms) prefill=479.99 tok/s TTFT=33635.2 ms peakVRAM=19266 MiB cpuMean=4.5% peakGPU=100%
+[bench]   cache hits 13744/30686 = 44.8% (admitted 0, refused 16942, 100.0% full)
+[bench]   spec: 20 rounds x 4, accepted 44/50 (0.88), 3.2 tok/round; mtp draft 3.031 ms/round
+[bench]   PLE RAM: 26.82 GiB resident, preloaded in 25.83 s (1.04 GiB/s); served 257104 rows (23.1 MB) from RAM
+[bench]   pool 41.27 ms/tok (drain 0.0, re-park 0.0, wait 0.0)
+[bench]   output: 3808 279 2919 430 279 3177 13569 59489 685 13 47690 220 16 17 19 13 ... (64 tokens)

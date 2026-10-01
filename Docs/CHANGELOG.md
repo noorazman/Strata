@@ -2,6 +2,30 @@
 
 Important historical changes and decisions. No raw logs.
 
+## 2026 — V100 Stage 1.16 (branch `stage1.3-expert-pool-sync`, GPU0 only)
+
+MoE prefill skinny-GU tensor-core GEMM (`STRATA_MOE_GEMM_TC=1`, opt-in, default OFF; `STRATA_MOE_GEMM_TC_MAXNE` default 64 / cap 128).
+**Verdict: WASH (mission stop rule) — profiled first; the GU expert GEMM (133,157 calls @16 K) has a
+FLOP-weighted ne distribution where the TC-routable skinny range (ne ≤ 64) is only 23.2 % of GU GEMM
+FLOPs but 75.5 % of the call count (100,543), served by cuBLAS as main + splitKreduce (140,299 reduces).
+The isolated `mma.sync.m8n8k4` f16→f32 kernel (m16×n128, uint4 k8 windows, register Q-cache, `template<bool
+FULL>` skip dispatch for T ≤ 8) wins 0.74–0.89× at ne ≤ 16 in the microbench but loses 1.14–1.76× at ne 32–64.
+Gates pass: 32-tok golden first-32 MATCH, fresh-engine 256-tok det 5/5, in-engine OFF/ON verify maxAbs ≤
+2.4e-06 (≈1 ULP f32 add-order), 16 K/32 K fill r1 byte-stable per leg, no CUDA errors. A/B (r1 cold): 16 K
+−1.2…−2.0 %, 32 K −0.4…+1.3 % — inside the ~±1–1.5 % r1-TTFT noise band, direction not clearly repeatable.
+nsys kernel-level: the routed GU-small GEMM genuinely improved 5.46 s cuBLAS → 3.43 s `tc_gu_kernel`
+(−37 %, −88.5 K launches; splitKreduce 140,299 → 51,603), but non-GEMM kernels absorbed +1.59 s
+(L2/DRAM contention with the TC W-stream) and the span was unchanged (35.43 → 35.35 s, GPU 84 % busy).
+Per the stop rule the path stays OFF-by-default, production restored + verified live. Also root-caused a
+pre-existing (NOT TC-specific) intermittent serve-mode warm r2 divergence (leg-A cuBLAS-only control
+flaked r2 1/4 on the exact s110 sequence). Follow-up (documented, not done this stage): a 2-D-tiled
+m64×n16 TC kernel to kill the intermediate-ne X-over-read loss. Implementation: `src/prefill/gemm.cu`
+(tc_mma816 + tc_gu_kernel template + tc_gemm_gu launcher + routing guard + env/verify hooks),
+`include/strata/prefill/gemm.hpp` (use_tc_/tc_max_ne_/tc_verify_/verify_dev_), `src/prefill/prefill.cpp`
+(Xs +128·N headroom). Tooling/data: `bench/v100/s116_gemm_tc.cu`, `bench/v100/s116nsys-16k-on.sh` +
+`Logs/gpu/s116nsys-16k-on.{nsys-rep,sqlite,run.log}`, `Logs/benchmarks/s116B-{g32,det1..det5,16k-r1,16k-r2}.json`.
+Doc: `Docs/v100-stage1.16-final.md`.
+
 ## 2026 — V100 Stage 1.15 (branch `stage1.3-expert-pool-sync`, GPU0 only)
 
 MoE prefill GEMM: cuBLASLt routing (`STRATA_MOE_GEMM_LT=1`, opt-in, default OFF).

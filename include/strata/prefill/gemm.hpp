@@ -51,6 +51,10 @@ private:
     void* lt_handle_ = nullptr;  // cublasLt handle (Stage 1.15: STRATA_MOE_GEMM_LT)
     bool use_lt_ = false;        // route f16() through cublasLtMatmul when true
     bool lt_fail_ = false;       // sticky: fall back to cublasGemmEx after an Lt error
+    bool use_tc_ = false;        // Stage 1.16: route skinny GU f16() GEMMs through the tensor-core kernel
+    int64_t tc_max_ne_ = 64;     // Stage 1.16: largest T routed to the TC kernel (STRATA_MOE_GEMM_TC_MAXNE, 1..128)
+    bool tc_verify_ = false;     // Stage 1.16 debug: also compute cuBLAS for routed calls and compare (STRATA_MOE_GEMM_TC_VERIFY)
+    float* verify_dev_ = nullptr;
 };
 
 

@@ -242,7 +242,9 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.attn_scratch = o.take<float>((size_t) m.attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s), ok);
     m.logits = o.take<float>(T * NE, ok); m.w = o.take<float>(T * K, ok); m.ids = o.take<int32_t>(T * K, ok);
     m.slot_dev = o.take<int32_t>(T * K, ok); m.src_dev = o.take<int32_t>(T * K, ok);
-    m.Xs = o.take<uint16_t>(T * K * N, ok); m.GU = o.take<float>(T * K * 1280, ok);
+    // The +128 f16 rows of headroom (Stage 1.16): the TC GU GEMM's padding n16 tiles read X rows up to
+    // 128 past T; those rows are only read (their outputs are masked), never written.
+    m.Xs = o.take<uint16_t>(T * K * N + 128 * N, ok); m.GU = o.take<float>(T * K * 1280, ok);
     m.Hh = o.take<uint16_t>(T * K * 640, ok); m.Dm = o.take<float>(T * K * N, ok);
     m.sgate = o.take<float>(T * 640, ok); m.sup = o.take<float>(T * 640, ok); m.sh_h = o.take<uint16_t>(T * 640, ok);
     m.shared = o.take<float>(T * N, ok); m.sg = o.take<float>(T, ok);
