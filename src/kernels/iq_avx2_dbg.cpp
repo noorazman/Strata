@@ -65,7 +65,7 @@ int main(int argc, char** argv) {
     {
         float* op[1] = {&full_mine};
         const void* av[1] = {act.data()};
-        cpu::iqavx2_rows(f.gu_type, row.data(), f.gu_row, (int) f.n_embd, av, 1, op, 0, 1);
+        cpu::iq256_rows(f.gu_type, row.data(), f.gu_row, (int) f.n_embd, av, 1, op, 0, 1);
     }
     std::printf("full row: ref %.9g mine %.9g %s\n", full_ref, full_mine, full_ref == full_mine ? "OK" : "DIFF");
 
@@ -78,7 +78,7 @@ int main(int argc, char** argv) {
         dot((int) f.n_embd, &br, 0, z.data(), 0, act.data(), 0, 1);
         float* op[1] = {&bm};
         const void* av[1] = {act.data()};
-        cpu::iqavx2_rows(f.gu_type, z.data(), f.gu_row, (int) f.n_embd, av, 1, op, 0, 1);
+        cpu::iq256_rows(f.gu_type, z.data(), f.gu_row, (int) f.n_embd, av, 1, op, 0, 1);
         if (br != bm) std::printf("block %d: ref %.9g mine %.9g DIFF\n", i, br, bm);
     }
     std::printf("done\n");

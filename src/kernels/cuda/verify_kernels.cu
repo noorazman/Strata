@@ -3,6 +3,7 @@
 // The per-token arithmetic of every kernel here is transcribed from its single-token original (fused_gdn.cu,
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/dp4a.hpp"
 
 #include <cuda_runtime.h>
 
@@ -244,12 +245,14 @@ __global__ void ident_hits_kernel(const int32_t* __restrict__ ids, int n, int32_
     if (i == 0) *count = n;
 }
 
-__global__ void gather_rows_kernel(const uint4* __restrict__ src, long long row16, const int32_t* __restrict__ ids,
-                                   long long n, uint4* __restrict__ dst) {
-    const long long total = n * row16;
+// E = the widest element the row size divides into (16, 4 or 1 bytes): a Q6_K head row of 2560 values is 2100 bytes
+template<typename E>
+__global__ void gather_rows_kernel(const E* __restrict__ src, long long row_e, const int32_t* __restrict__ ids,
+                                   long long n, E* __restrict__ dst) {
+    const long long total = n * row_e;
     for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (long long) gridDim.x * blockDim.x) {
-        const long long r = i / row16, o = i - r * row16;
-        dst[i] = src[(long long) ids[r] * row16 + o];
+        const long long r = i / row_e, o = i - r * row_e;
+        dst[i] = src[(long long) ids[r] * row_e + o];
     }
 }
 
@@ -334,8 +337,13 @@ void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const 
 }
 
 void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int64_t n, uint8_t* dst, void* stream) {
-    if (row_bytes % 16 != 0) { std::fprintf(stderr, "gather_rows: row size must be a multiple of 16\n"); std::exit(1); }
-    gather_rows_kernel<<<48 * 8, 256, 0, (cudaStream_t) stream>>>((const uint4*) src, row_bytes / 16, ids, n, (uint4*) dst);
+    cudaStream_t s = (cudaStream_t) stream;
+    if (row_bytes % 16 == 0)
+        gather_rows_kernel<<<48 * 8, 256, 0, s>>>((const uint4*) src, row_bytes / 16, ids, n, (uint4*) dst);
+    else if (row_bytes % 4 == 0)
+        gather_rows_kernel<<<48 * 8, 256, 0, s>>>((const uint32_t*) src, row_bytes / 4, ids, n, (uint32_t*) dst);
+    else
+        gather_rows_kernel<<<48 * 8, 256, 0, s>>>(src, row_bytes, ids, n, dst);
     check("gather_rows");
 }
 
@@ -431,6 +439,8 @@ __global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t valu
         if (fence_period > 0 && (n % fence_period) == 0) __threadfence_system();
     }
     if (iters) *iters = n;   // Stage 1.6 probe: how many poll iterations the wait took
+__global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
+    while (*flag < value) strata_spin_pause();
     __threadfence_system();
 }
 }  // namespace
@@ -450,6 +460,95 @@ static uint64_t wait_fence_period() {
 
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream, uint64_t* iters) {
     wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, iters, wait_fence_period());
+namespace {
+__global__ void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int k, const int32_t* __restrict__ res,
+                                     int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off,
+                                     long long blob, int32_t* __restrict__ pl, long long capx, uint32_t* skip,
+                                     uint32_t ring) {
+    // one thread: at most kVerifyMaxT * 10 entries, the host's exact loop
+    for (int i = 0; i < n; ++i) {
+        const int32_t e = ids[i];
+        if (e < 0 || e >= n_expert || res[e] < 0) { *skip = 0; return; }
+    }
+    int32_t* counts = pl;
+    int32_t* start = pl + 4;
+    int32_t* dst = start + capx + 1;
+    int32_t* tok = dst + capx;
+    const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+    unsigned long long* ptr = (unsigned long long*) (pl + ptr_off);
+    int32_t* start2 = pl + ptr_off + 4 * capx;
+    int groups = 0, entries = 0;
+    for (int i0 = 0; i0 < n; ++i0) {
+        bool first = true;
+        for (int j = 0; j < i0; ++j) if (ids[j] == ids[i0]) { first = false; break; }
+        if (!first) continue;
+        const int32_t slot = res[ids[i0]];
+        ptr[groups] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
+        start[groups] = entries;
+        for (int i = i0; i < n; ++i)
+            if (ids[i] == ids[i0]) {
+                // an entry belongs to i0's group when its first occurrence is i0: the same expert id
+                dst[entries] = i;
+                tok[entries] = i / k;
+                ++entries;
+            }
+        ++groups;
+    }
+    start[groups] = entries;
+    start2[0] = entries;
+    counts[0] = groups;
+    counts[1] = entries;
+    counts[2] = 0;
+    __threadfence();
+    *skip = ring;
+}
+__global__ void wait_flag_ge_or_kernel(const volatile uint32_t* flag, uint32_t value, const volatile uint32_t* skip) {
+    if (*skip == value) return;
+    while (*flag < value) strata_spin_pause();
+    __threadfence_system();
+}
+__global__ void copy_i32_unless_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n,
+                                       const uint32_t* skip, uint32_t value) {
+    if (*skip == value) return;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
+}
+__global__ void copy_or_zero_kernel(float4* __restrict__ dst, const volatile float4* src, long long n4,
+                                    const uint32_t* skip, uint32_t value) {
+    const bool zero = *skip == value;
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (long long) gridDim.x * blockDim.x)
+        dst[i] = zero ? make_float4(0.f, 0.f, 0.f, 0.f) : const_cast<const float4*>(src)[i];
+}
+}  // namespace
+
+void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
+                   const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
+                   long long capx, uint32_t* skip, uint32_t ring, void* stream) {
+    resident_plan_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off,
+                                                             blob, plan, capx, skip, ring);
+    check("resident_plan");
+}
+void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
+    wait_flag_ge_or_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, skip);
+    check("wait_flag_ge_or");
+}
+void copy_i32_from_mapped_unless(int32_t* dst, const int32_t* src, long long n, const uint32_t* skip, uint32_t value,
+                                 void* stream) {
+    if (n <= 0) return;
+    copy_i32_unless_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(dst, (const volatile int32_t*) src, (int) n, skip, value);
+    check("copy_i32_from_mapped_unless");
+}
+void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const uint32_t* skip, uint32_t value,
+                              void* stream) {
+    if (n <= 0) return;
+    const long long n4 = n / 4;
+    const int blocks = (int) ((n4 + 255) / 256 < 64 ? (n4 + 255) / 256 : 64);
+    copy_or_zero_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>((float4*) dst, (const volatile float4*) src, n4, skip,
+                                                                    value);
+    check("copy_or_zero_from_mapped");
+}
+
+void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
+    wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
     check("wait_flag_ge");
 }
 
@@ -472,6 +571,20 @@ void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* i
     const unsigned blocks = (unsigned) ((n + 255) / 256 < 64 ? (n + 255) / 256 : 64);
     copy_indexed_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(dst, src, stride, index, n);
     check("copy_indexed");
+}
+
+// a GPU timestamp (ns, %globaltimer) into buf[i] - the verify window's stage profiler
+namespace { __global__ void gpu_stamp_kernel(unsigned long long* buf, int i) {
+    unsigned long long t;
+#if defined(__HIPCC__)
+    t = wall_clock64() * 10ull;   // gfx10.3 / gfx11 / gfx12: a constant 100 MHz counter, in ns
+#else
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+#endif
+    buf[i] = t;
+} }
+void gpu_stamp(unsigned long long* buf, int i, void* stream) {
+    gpu_stamp_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(buf, i);
 }
 
 }  // namespace strata::kernels

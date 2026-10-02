@@ -64,8 +64,8 @@ int main(int argc, char** argv) {
         std::memcpy(blob.data() + f.up_off, gguf.tensor_data(*t[1]) + (size_t) E * f.up_off, f.up_off);
         std::memcpy(blob.data() + f.down_off, gguf.tensor_data(*t[2]) + (size_t) E * f.d_row * (size_t) H,
                     f.d_row * (size_t) H);
-        const bool gu_ok = cpu::iqavx2_supported(f.gu_type);
-        const bool dn_ok = cpu::iqavx2_supported(f.d_type);
+        const bool gu_ok = cpu::iq256_supported(f.gu_type);
+        const bool dn_ok = cpu::iq256_supported(f.d_type);
         if (!gu_ok && !dn_ok) {
             std::printf("layer %d: gu type %d, down type %d - not an iq_avx2 pair, skipped\n", l, f.gu_type, f.d_type);
             continue;
@@ -113,7 +113,7 @@ int main(int argc, char** argv) {
             if (gu_ok) {
                 float* outptr[NTMAX];
                 for (int t = 0; t < NTMAX; ++t) outptr[t] = out[t].data();
-                cpu::iqavx2_gu_rows(f.gu_type, blob.data(), f.gu_row, f.up_off, n, av[nt].data(), nt, outptr, 0,
+                cpu::iq256_gu_rows(f.gu_type, blob.data(), f.gu_row, f.up_off, n, av[nt].data(), nt, outptr, 0,
                                     (int) FF);
                 for (int r = 0; r < (int) FF; ++r)
                     for (int tt = 0; tt < nt; ++tt)
@@ -140,7 +140,7 @@ int main(int argc, char** argv) {
             if (dn_ok) {
                 float* dnptr[NTMAX];
                 for (int t = 0; t < NTMAX; ++t) dnptr[t] = dout[t].data();
-                cpu::iqavx2_rows(f.d_type, blob.data() + f.down_off, f.d_row, (int) f.n_ff, hv[nt].data(), nt, dnptr,
+                cpu::iq256_rows(f.d_type, blob.data() + f.down_off, f.d_row, (int) f.n_ff, hv[nt].data(), nt, dnptr,
                                  0, (int) H);
                 for (int r = 0; r < (int) H; ++r)
                     for (int tt = 0; tt < nt; ++tt)

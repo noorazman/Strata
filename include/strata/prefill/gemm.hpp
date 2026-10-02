@@ -6,6 +6,7 @@
 // rounded to BF16, which is also what llama.cpp's batched CUDA path does.  Tensor-core GEMM through cuBLAS.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -52,6 +53,8 @@ public:
     /// ceil(ne / 16).  Shape is fixed (N = 1280, K = 2560, ldy = 1280).  `etab` (host) is used only
     /// for the STRATA_MOE_GEMM_TC_VERIFY co-computation and may be null.
     void gu_grouped(const GroupedExpert* etab_dev, const GroupedExpert* etab, int G, int total_tiles);
+    /// Caller-owned buffers only: the scratch and workspace moved (the prompt path laid its buffers out again).
+    void rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes);
 
     uint16_t* scratch() const { return scratch_; }
     int64_t scratch_elems() const { return scratch_elems_; }
@@ -74,6 +77,7 @@ private:
     int64_t tc_max_ne_ = 64;     // Stage 1.16: largest T routed to the TC kernel (STRATA_MOE_GEMM_TC_MAXNE, 1..128)
     bool tc_verify_ = false;     // Stage 1.16 debug: also compute cuBLAS for routed calls and compare (STRATA_MOE_GEMM_TC_VERIFY)
     float* verify_dev_ = nullptr;
+    void* hipblaslt_state_ = nullptr;
 };
 
 

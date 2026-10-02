@@ -19,6 +19,8 @@ __pycache__/
 # plan v0.3 P1 (repository hygiene, review E1): profiler captures and large diagnostic dumps stay out of git.
 *.nsys-rep
 *.ncu-rep
+
+# Pi harness metadata (local session state, not project source)
 *.sqlite
 *.npz
 *.occ1
@@ -27,7 +29,7 @@ td.log
 # created by setup.py on the user's machine
 /.venv/
 /build/
-/third_party/llama.cpp/
+/third_party/llama.cpp
 /models/
 /packs/
 /mtp/
@@ -36,6 +38,7 @@ td.log
 /strata-*.json
 /strata-*.log
 /build-strata.bat
+/.strata-mcp/
 
 # image encoder (setup.py --vision): build output and the generated build script
 build-vision*/
@@ -51,3 +54,4 @@ build-vision.bat
 # Stage 1.1: extensionless nsys sqlite exports (plan v0.3 P1: large dumps out of git;
 # regenerate with: nsys export --type sqlite -o Logs/gpu/<name> Logs/gpu/<name>.nsys-rep)
 Logs/gpu/nsys-*
+/.rocm-win/
