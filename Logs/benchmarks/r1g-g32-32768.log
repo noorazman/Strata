@@ -1,0 +1,58 @@
+strata generate: this CPU has no AVX-512: the expert kernels run on AVX2
+strata generate: native pack: packs/swift-iq3_xxs experts (largest blob 2.33 MB), token embedding type 21 in mapped host memory (260 MiB)
+strata generate: 1466 MiB of weights loaded from packs/swift-iq3_xxs (302 canonical tensors skipped: served natively)
+strata generate: 300 native projection matrices, 1781.11 MiB of weights
+strata generate: PLE ram: preloaded 320001536 rows (26.82 GiB) in 19.07 s (1.41 GiB/s); RAM-resident for the whole run
+strata generate: PLE on, table 320001536 rows of /mnt/ssd/llm_models/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf (PLE I/O mode: ram)
+strata experts: arena first-touch pinned to node 0 (default: the host thread's node (Stage 1.6))
+strata generate: expert arena: cudaHostRegister PORTABLE ok; MAP_HUGETLB unavailable (no hugetlb pool configured?); using 4 KB pages
+strata generate: loaded 39.97 GiB at 1.31 GiB/s
+strata mtp: draft layer loaded, 838 MiB of VRAM (experts 675, dense 111)
+strata generate: profile data/expert-profile.bin: 8000 ranked pairs, built for 8000 slots
+strata generate: expert cache auto: 26.61 GiB free, 700 MiB reserved -> 8000 slots
+strata generate: expert cache 8000 slots, 12.93 GiB of VRAM; policy is
+strata generate: *** WARNING: --expert-cache is enabled and the GPU hit path is NOT
+                 CORRECT. The generated tokens diverge from a cache-off run (measured:
+                 first difference at token 40 at 2.97% hits, token 0 at 54.4%). Any
+                 timing from this run is real; any OUTPUT from it is not. ***
+                 PROFILE, ranked by routing frequency, no eviction.
+strata generate: pre-filled 8000 of 8000 slots from the profile; slot 0 verified
+strata generate: R4 hit path ON - resident experts are computed on the GPU
+strata generate: 24 expert-pool workers + the host thread (worker park: hybrid spin-2048us+futex (default), rows: async (workers raise flag C))
+strata generate: session is up; locating the head
+strata generate: experimental native Q5_K head, 437043200 bytes
+strata generate: token graph hit path: 8000 resident experts, decided on the device
+strata generate: prompt path borrows 928 cache slots (1.51 GiB)
+strata mtp: draft head over 40525 tokens (68.0 MiB)
+strata generate: 928 lent slots refilled in 161.1 ms
+strata generate: prefill 28 tokens in 1 chunks, 1093.4 ms (25.6 tok/s); experts streamed 2283 (2283 by DMA, host 13.1 ms), resident 1812; PLE 11.7 ms
+strata verify: window up to 4 tokens, 62.0 MiB of device buffers
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: captured the 4-token window (upload no error, sync no error)
+strata verify: captured the 2-token window (upload no error, sync no error)
+speculation              12 rounds of 4, drafts accepted 20 of 26 (0.769), 2.67 tokens per round
+window sizes             T1:2 T2:2 T3:0 T4:8  (min draft probability 0.50)
+accepted per round       0:3 1:2 2:3 3:4
+verify window            wait for rings 26.225  pool 25.735  host 0.053  commit 0.877 ms/round; CPU experts 6.54 distinct / 9.39 routed per layer
+verify round head        layer 0 (round head): wait 0.000 (max 0.000)  pool 2.074 (max 0.000) ms/round
+verify slow layers       slowest spins (decode-relative):  t+337 l1/g0 14.3ms  t+616 l1/g0 13.1ms  t+762 l20/g0 2.1ms  t+743 l1/g0 1.1ms  t+551 l1/g0 1.0ms  | slowest pools:  t+35 l0/g0 17.3ms  t+149 l23/g0 2.1ms  t+167 l33/g0 1.8ms  t+401 l43/g0 1.5ms  t+158 l28/g0 1.3ms  
+pool multi               gate/up 22.697  quantize 0.000  down 0.000 ms/round; 24.2 GB/s over the rows phases; CPU pool call 25.709 ms/round (rows async)
+dispatch                 plan 0.846  activation quantize 2.298  jobs 0.843  run 21.703 ms/round
+dispatch slow            slowest dispatch: t+-17ms l0 t1 j3 total 17.3 (plan 0.0 actq 15.1 jobs 0.0 run 2.2 [gu 0.0 q 0.0 down 0.0])  t+97ms l23 t4 j14 total 2.1 (plan 0.0 actq 0.0 jobs 0.0 run 2.1 [gu 0.0 q 0.0 down 0.0])  t+115ms l33 t4 j19 total 1.8 (plan 0.0 actq 0.0 jobs 0.0 run 1.8 [gu 0.0 q 0.0 down 0.0])  t+349ms l43 t4 j13 total 1.5 (plan 0.0 actq 0.0 jobs 0.0 run 1.4 [gu 0.0 q 0.0 down 0.0])  t+106ms l28 t4 j9 total 1.3 (plan 0.0 actq 0.0 jobs 0.0 run 1.2 [gu 0.0 q 0.0 down 0.0])  t+406ms l37 t4 j14 total 1.3 (plan 0.0 actq 0.0 jobs 0.0 run 1.2 [gu 0.0 q 0.0 down 0.0])  t+341ms l37 t4 j10 total 1.2 (plan 0.0 actq 0.0 jobs 0.0 run 1.1 [gu 0.0 q 0.0 down 0.0])  t+528ms l23 t4 j13 total 1.2 (plan 0.0 actq 0.0 jobs 0.0 run 1.1 [gu 0.0 q 0.0 down 0.0])  
+dispatch dist            dispatch: <20us n=11  20-50us n=9  50-100us n=13  100-200us n=56  200-500us n=215  0.5-1ms n=237  >=1ms n=35  | run: <20us n=20  20-50us n=0  50-100us n=24  100-200us n=72  200-500us n=243  0.5-1ms n=195  >=1ms n=22  
+dispatch per-layer       l0: l0 12/2.1/0.7  l1 12/0.4/0.3  l2 12/0.5/0.4  l3 12/0.4/0.4  l4 12/0.5/0.4  l5 12/0.4/0.3  l6 12/0.3/0.3  l7 12/0.5/0.4  l8 12/0.7/0.6  l9 12/0.4/0.3  l10 12/0.4/0.4  l11 12/0.4/0.4  l12 12/0.4/0.4  l13 12/0.4/0.3  l14 12/0.5/0.4  l15 12/0.4/0.3  l16 12/0.4/0.4  l17 12/0.5/0.5  l18 12/0.6/0.6  l19 12/0.4/0.4  l20 12/0.7/0.7  l21 12/0.4/0.4  l22 12/0.6/0.5  l23 12/0.8/0.8  
+                         l24: l24 12/0.6/0.6  l25 12/0.4/0.4  l26 12/0.4/0.3  l27 12/0.4/0.4  l28 12/0.6/0.5  l29 12/0.4/0.3  l30 12/0.8/0.7  l31 12/0.4/0.3  l32 12/0.7/0.7  l33 12/0.8/0.7  l34 12/0.6/0.5  l35 12/0.5/0.5  l36 12/0.5/0.5  l37 12/0.7/0.6  l38 12/0.4/0.3  l39 12/0.5/0.4  l40 12/0.4/0.4  l41 12/0.5/0.4  l42 12/0.3/0.2  l43 12/0.7/0.6  l44 12/0.5/0.4  l45 12/0.5/0.4  l46 12/0.5/0.5  l47 12/0.4/0.4  
+adaptive tier            288 experts swapped into the VRAM tier (every 4 rounds, 1.289 ms/round)
+pcie experts             0.93 distinct experts per layer read over PCIe (share 51/256 of the misses)
+mtp                      2.183 ms/round drafting (11 rounds), MTP prompt 28.9 ms, 906 MiB of VRAM
+prompt  : 9419 11 821 803 369 7967 13 353 1044 264 11952 5617 303 220 17 15 17 21 13 10875 353 668 3184 488 883 821 1118 1834 13
+output  : 271 248068 198 760 1156 369 30869 5402 430 328 23202 1288 264 11952 5617 303 220 17 15 17 21 11 321 369 883 310 3184 728 883 836 1118 1834
+decode                   32 tokens in 799.8 ms  ->  40.01 tok/s
+prefill                  28 tokens in 1254.5 ms  ->  22.32 tok/s  (time to first token 1482.8 ms)
+  per token              24.993 ms/token (WALL CLOCK: embed, layers, head, sample)
+  ple ram: 320001536 rows resident (26.82 GiB), preloaded in 19.07 s (1.41 GiB/s); served 1056 rows (0.1 MB) from RAM
+  the CPU expert pool    25.709 ms/token over 48 layers (12 positions, 576 dispatches)
+  pool phases              wait-park 0.000  drain 0.000  re-park 0.000  ms/token
+  expert blobs           15805 blobs read
+  R4 overlap             0 of 0 layers the hit work was DONE when the pool returned
+  R4 expert-cache hits   12277 of 17688 = 0.6941      (0 admitted, 5411 refused, cache 100.0000% full)

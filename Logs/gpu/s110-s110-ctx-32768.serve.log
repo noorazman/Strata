@@ -1,0 +1,7 @@
+loading the model (the first start takes a minute or two) ...
+ready: http://127.0.0.1:8180/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, context 32768 tokens)
+       open http://127.0.0.1:8180/ in a browser to chat; close this window to stop the model
+strata serve ttft: {"endpoint":"/v1/chat/completions","prompt_tokens":152,"thinking":true,"max_new":8,"stream":true,"n_ids":152,"t_json_ms":0.081,"t_prepare_ms":3.487,"t_gen_write_ms":3.861,"t_first_engine_tok_ms":2116.602,"t_first_sse_ms":3.64,"t_first_reasoning_ms":2116.871,"t_done_ms":2266.728}
+strata serve ttft: {"endpoint":"/v1/chat/completions","prompt_tokens":1076,"thinking":true,"max_new":16,"stream":true,"n_ids":1076,"t_json_ms":0.061,"t_prepare_ms":11.147,"t_gen_write_ms":11.693,"t_first_engine_tok_ms":3375.567,"t_first_sse_ms":11.265,"t_first_reasoning_ms":3375.841,"t_done_ms":3726.017}
+strata serve ttft: {"endpoint":"/v1/chat/completions","prompt_tokens":32504,"thinking":true,"max_new":256,"stream":true,"n_ids":32504,"t_json_ms":0.581,"t_prepare_ms":216.375,"t_gen_write_ms":229.303,"t_first_engine_tok_ms":66278.025,"t_first_sse_ms":216.505,"t_first_reasoning_ms":66278.266,"t_done_ms":71500.872}
+strata serve ttft: {"endpoint":"/v1/chat/completions","prompt_tokens":32504,"thinking":true,"max_new":256,"stream":true,"n_ids":32504,"t_json_ms":0.427,"t_prepare_ms":233.816,"t_gen_write_ms":246.463,"t_first_engine_tok_ms":65832.499,"t_first_sse_ms":233.932,"t_first_reasoning_ms":65832.735,"t_done_ms":70720.665}

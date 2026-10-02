@@ -1,0 +1,33 @@
+[10:22:03] ctx 16384 g32 (max-new 32)
+[10:23:58] g32 rc=0
+[10:23:58] ctx 16384 det1 (max-new 256)
+[10:25:55] det1 rc=0
+[10:25:55] ctx 16384 det2 (max-new 256)
+[10:27:40] det2 rc=0
+[10:27:40] ctx 16384 det3 (max-new 256)
+[10:29:39] det3 rc=0
+--- ctx 16384 determinism (det1 vs det2 vs det3, fresh engines)
+Logs/benchmarks/r1g-det1-16384.json: n=256 md5=cdb7f7d056f339ba704d3bb9620a1dec prefix32=ok
+Logs/benchmarks/r1g-det2-16384.json: n=256 md5=cdb7f7d056f339ba704d3bb9620a1dec prefix32=ok
+Logs/benchmarks/r1g-det3-16384.json: n=256 md5=cdb7f7d056f339ba704d3bb9620a1dec prefix32=ok
+Logs/benchmarks/r1g-det1-16384.json == Logs/benchmarks/r1g-det2-16384.json (byte-identical, n=256)
+Logs/benchmarks/r1g-det1-16384.json == Logs/benchmarks/r1g-det3-16384.json (byte-identical, n=256)
+--- ctx 16384 golden prefix
+Logs/benchmarks/r1g-g32-16384.json: n=32 first-32 golden-prefix: MATCH
+[10:29:40] ctx 32768 g32 (max-new 32)
+[10:31:37] g32 rc=0
+[10:31:37] ctx 32768 det1 (max-new 256)
+[10:33:42] det1 rc=0
+[10:33:42] ctx 32768 det2 (max-new 256)
+[10:36:09] det2 rc=0
+[10:36:09] ctx 32768 det3 (max-new 256)
+[10:38:17] det3 rc=0
+--- ctx 32768 determinism (det1 vs det2 vs det3, fresh engines)
+Logs/benchmarks/r1g-det1-32768.json: n=256 md5=cdb7f7d056f339ba704d3bb9620a1dec prefix32=ok
+Logs/benchmarks/r1g-det2-32768.json: n=256 md5=cdb7f7d056f339ba704d3bb9620a1dec prefix32=ok
+Logs/benchmarks/r1g-det3-32768.json: n=256 md5=cdb7f7d056f339ba704d3bb9620a1dec prefix32=ok
+Logs/benchmarks/r1g-det1-32768.json == Logs/benchmarks/r1g-det2-32768.json (byte-identical, n=256)
+Logs/benchmarks/r1g-det1-32768.json == Logs/benchmarks/r1g-det3-32768.json (byte-identical, n=256)
+--- ctx 32768 golden prefix
+Logs/benchmarks/r1g-g32-32768.json: n=32 first-32 golden-prefix: MATCH
+[10:38:18] ALL RELEASE-1 ENGINE GATES DONE

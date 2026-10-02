@@ -2,6 +2,39 @@
 
 Important historical changes and decisions. No raw logs.
 
+## 2026 — V100 Release 1 (production freeze, branch `stage1.3-expert-pool-sync`, tag `v100-release1`, GPU0 only)
+
+**RELEASE 1 READY — BASELINE FROZEN.** Productionization & validation milestone (NOT an optimization
+stage): the latest validated Stage 1.x baseline (`a374342`, Stage 1.17 HEAD) is frozen as Release 1 —
+Qwen3.8 Flash Next MoE (Swift IQ3_XXS) on 1× Tesla V100 32 GB PCIe (GPU0, SM70). Frozen production
+config: 32K context, int8 KV, 8,000-slot expert cache (`--expert-cache auto` + `data/expert-profile.bin`),
+`--prefill 2048 --spec 4 --spec-min-p 0.5 --pool-workers 24 --mtp mtp/rt`, PLE ram (program default since
+1.2B), `--pcie-frac 0.2` (native default since 1.3) + **`STRATA_MOE_DQ_WIDE=1`** — the one Stage 1.x
+improvement promoted into production (Stage 1.14: bit-identical, prefill-only, dequant kernel −49.6/−49.7 %
+@16K/32K); it is now set in the `strata.service` env (the only unit change). All experimental paths stay
+OFF: `STRATA_MOE_GEMM_LT` (1.15), `STRATA_MOE_GEMM_TC` (1.16), `STRATA_MOE_GEMM_GROUPED` (1.17), E5 fusion
+(1.12), E8 14K cache (1.13), E3/E4/E7 (1.11), `STRATA_WAIT_FENCE` (1.10), E1/E3 (1.7) — verified via the
+live engine's `/proc/<pid>/environ` (exactly `CUDA_VISIBLE_DEVICES=0` + `STRATA_MOE_DQ_WIDE=1`).
+All 14 release gates PASS: (1) clean SM70 build (wiped `build-sm70`, sm_70-only fatbin ×39 ELF, ctest 19/20
+= pre-existing `ple_parity` only); (2) 32K/int8 config boots (8,000 slots pre-filled + verified, int8 KV,
+32,768 ctx); (3) `strata.service` starts (~95–105 s); (4) `/health` ok; (5) live API request ok
+(OpenAI `/v1/chat/completions`); (6) 32-tok golden prefix MATCH @16K+32K (first token 271); (7) 256-tok
+determinism **3/3 fresh engines byte-identical at both contexts** (md5 `cdb7f7d056f339ba704d3bb9620a1dec`
+= the 1.10–1.14 int8 reference); (8+9) 16K/32K serve-mode production validation — **r1 fill outputs
+byte-identical to the 1.14–1.17 anchors at both contexts** (16K `6041c5f3…`, 32K `1fbe577e…`) with r1 TTFT
+37.98 s @16K / 71.50 s @32K (inside the 1.14–1.17 anchor band 37.7–40.7 / 71.4–76.8 s); (10) zero CUDA
+errors/OOM/hangs in any log, VRAM peaks 18,926/19,178 MiB = the 8K-baseline values (~13.6 GB margin),
+only GPU0 touched; (11) experimental flags OFF (/proc check); (12) performance vs baseline PASS (r1
+anchors + byte-identical outputs); (13) decode class PASS — serve 51.09/54.27 @16K, 49.51/52.00 @32K tok/s
+(det-gate 48.4–49.0 @16K, 46.3–49.4 @32K; the documented 48–58 tok/s production class); (14) reproducible
+from a clean start (wiped build → daemon-reload → fresh service → fresh engines; exact procedure in
+`Docs/v100-release1.md` §6). Known limitations (doc §7): prefill is MoE-weight-streaming bound (~170 GB
+H2D @16K), the 8K profile is stale for general traffic (E8 = first post-release candidate), serve-mode
+warm-r2 divergence is pre-existing (1.16), ROUND 328 decode hit-path numerics remain upstream-declared
+NOT CORRECT, machine MCE stream explains the ~±1.5–2.7 % r1-TTFT band. No new performance experiments in
+Release 1; remaining MoE GEMM/DMA optimizations are deferred until after Release 4. Doc:
+`Docs/v100-release1.md`; harness `bench/v100/r1gates.sh`; raw data `Logs/` (doc §8).
+
 ## 2026 — V100 Stage 1.17 (branch `stage1.3-expert-pool-sync`, GPU0 only)
 
 MoE prefill grouped skinny-GU GEMM (`STRATA_MOE_GEMM_GROUPED=1`, opt-in, default OFF; reuses

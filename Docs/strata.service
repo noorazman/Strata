@@ -26,6 +26,12 @@ LimitMEMLOCK=infinity
 Environment=CUDA_VISIBLE_DEVICES=0
 # CUDA runtime libraries on the loader path (matches the config's lib_dirs).
 Environment=LD_LIBRARY_PATH=/usr/local/cuda/lib64
+# Release 1 (frozen): the one validated Stage 1.x improvement enabled in production —
+# MoE prefill dequant wide memory ops (Stage 1.14, STRATA_MOE_DQ_WIDE: bit-identical
+# output, prefill-only, dequant kernel time -49.6/-49.7 % at 16K/32K). All experimental
+# paths stay OFF (STRATA_MOE_GEMM_LT, STRATA_MOE_GEMM_TC, STRATA_MOE_GEMM_GROUPED,
+# E5 fusion, E8 14K cache) — see Docs/v100-release1.md.
+Environment=STRATA_MOE_DQ_WIDE=1
 
 ExecStart=/home/noorazman/dsh/strata/Strata/.venv/bin/python -m serve.server --engine strata --config /home/noorazman/dsh/strata/Strata/strata-swift-iq3_xxs.json --host 0.0.0.0 --port 8180
 
