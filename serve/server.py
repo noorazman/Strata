@@ -2216,7 +2216,7 @@ def make_handler(svc: Service):
                     else:
                         self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
                     self.wfile.flush()
-                    if tt:
+                    if tt and c is not None:
                         d = c["choices"][0]["delta"]
                         if d.get("reasoning_content") and "t_first_reasoning" not in tt:
                             tt["t_first_reasoning"] = time.perf_counter()
@@ -2293,7 +2293,7 @@ def make_handler(svc: Service):
                         self.wfile.write(f"event: {name}\n".encode() + b"data: " +
                                          json.dumps(e, ensure_ascii=False).encode() + b"\n\n")
                     self.wfile.flush()
-                    if tt and name == "content_block_delta":
+                    if tt and item is not None and name == "content_block_delta":
                         d = e.get("delta", {})
                         if d.get("type") == "thinking_delta" and "t_first_reasoning" not in tt:
                             tt["t_first_reasoning"] = time.perf_counter()
