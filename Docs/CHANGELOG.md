@@ -2,6 +2,31 @@
 
 Important historical changes and decisions. No raw logs.
 
+## 2026 — V100 Stage 1.17 (branch `stage1.3-expert-pool-sync`, GPU0 only)
+
+MoE prefill grouped skinny-GU GEMM (`STRATA_MOE_GEMM_GROUPED=1`, opt-in, default OFF; reuses
+`STRATA_MOE_GEMM_TC_MAXNE` for the skinny range, now honored regardless of TC).
+**Verdict: WASH (negative, mission stop rule) — profiled first (fresh 1.16-production nsys: span 37.56 s,
+80.2 % busy, 1.61 s of main-stream gaps before the 388,819 GEMM dispatches, skinny-GU share ≈0.65 s — the
+launch consolidation is on the critical path), so the GROUPED direction was picked over a repeat of 1.16's
+per-expert TC class (measured WASH); the microbench confirmed the per-expert tiles only win at ne ≤ 16 and the
+G2 grouped variant (S12-tile body, 4-way in-block k-split, deterministic smem reduce, binary-search expert
+lookup) is the direction with a NEW lever. ONE isolated change: per chunk-layer, dequant all routed experts
+into per-expert pools (512 × 9.83 MB = 4.7 GB, plain cudaMalloc — the first build allocated them from the
+prefill borrow, which nsys showed carves ~2,900 of the 8,000 expert-cache slots and costs +9.6 s of
+compute-stream idle; corrected before shipping), then ONE grouped `g2_gu_kernel` launch over all
+1 ≤ ne ≤ tc_max_ne experts (384 launches / 2.68 s replacing 107 K cutlass/wmma launches + 88.7 K of the
+140,299 splitKreduces; total launches −188,447), then per-expert swiglu + D GEMM unchanged. Gates: maxAbs
+≤ 3.1e-06 vs cuBLAS (in-engine verify hook), first token 271 = golden, leg-B fresh-engine determinism 5/5,
+leg-A re-runs reproduce the 1.16 anchor md5s exactly. A/B (r1 cold): 16 K +3.5…+4.4 s (+8.8…+10.8 %) and
+32 K +6.7 s (+8.7 %), both far outside the noise band — nsys root-causes it: GEMM-family GPU busy is ≈
+neutral (the dispatch win ≈ 0.65 s is real but small), while the dequant-first reordering breaks the
+baseline's dequant/GEMM interleave under the 8-slot expert-DMA staging pipeline (wait cadence ~100 µs →
+~20 µs vs ~180 µs per 1.7 MB blob at 9.4 GB/s DMA), so compute-stream idle goes 7.69 → 14.67 s (p99 gap
+97 → 191 µs). OFF-by-default; production restored + verified live. Next bottleneck (measured order): the
+100–200 µs CPU-side compute-stream waits (deeper DMA staging ≈ 54 MB for 32 in-flight slots), smem-staged
+G2b (L1-queue stall, 63.1 % L1TEX-scoreboard per ncu), grouped D GEMM. Doc: `Docs/v100-stage1.17-final.md`.
+
 ## 2026 — V100 Stage 1.16 (branch `stage1.3-expert-pool-sync`, GPU0 only)
 
 MoE prefill skinny-GU tensor-core GEMM (`STRATA_MOE_GEMM_TC=1`, opt-in, default OFF; `STRATA_MOE_GEMM_TC_MAXNE` default 64 / cap 128).

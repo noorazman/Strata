@@ -122,6 +122,15 @@ struct Prefill::Impl {
     bool moe_dq_wide = false;
     uint16_t* dq_gu[DQ] = {};
     uint16_t* dq_d[DQ] = {};
+    // Stage 1.17 (opt-in, STRATA_MOE_GEMM_GROUPED=1): the skinny GU experts of a chunk-layer are
+    // dequantized into PER-EXPERT pools (indexed by expert id, 512 slots) so their GU GEMMs can run
+    // as ONE grouped tensor-core launch (Gemm::gu_grouped).  Allocated only when the env is set; the
+    // default path keeps the 2-slot rings above.  +5.0 GB of VRAM (512 x 9.83 MB dequantized).
+    bool moe_gu_grouped = false;
+    uint16_t* dqg_gu = nullptr;
+    uint16_t* dqg_d = nullptr;
+    std::vector<strata::prefill::GroupedExpert> gu_etable;
+    void* gu_etable_dev = nullptr;
     uint8_t* stage_dev[STAGE] = {};
     uint8_t* stage_host[STAGE] = {};
     cudaEvent_t copied[STAGE] = {}, used[STAGE] = {};
@@ -149,6 +158,9 @@ Prefill::~Prefill() {
         if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
         if (impl_->stage_host[i]) cudaFreeHost(impl_->stage_host[i]);
     }
+    if (impl_->gu_etable_dev) cudaFree(impl_->gu_etable_dev);
+    if (impl_->dqg_gu) cudaFree(impl_->dqg_gu);
+    if (impl_->dqg_d) cudaFree(impl_->dqg_d);
     if (impl_->copy) cudaStreamDestroy(impl_->copy);
     if (impl_->copy2) cudaStreamDestroy(impl_->copy2);
     if (impl_->route_dump) std::fclose(impl_->route_dump);
@@ -158,6 +170,9 @@ Prefill::~Prefill() {
 namespace {
 constexpr int64_t GEMM_SCRATCH = 32ll << 20;        // FP16 elements for the largest dequantized dense weight
 constexpr size_t GEMM_WS = 32u << 20;               // cuBLAS workspace
+// Stage 1.17: element counts of one dequantized expert weight (the per-expert grouped pools).
+constexpr int64_t GU_EL = 1280 * 2560;              // gate/up f16
+constexpr int64_t D_EL = 2560 * 640;                // down f16
 }
 
 bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
@@ -207,6 +222,13 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     if (const char* dw = std::getenv("STRATA_MOE_DQ_WIDE"); dw && std::string(dw) == "1") {
         m.moe_dq_wide = true;
     }
+    // Stage 1.17 (opt-in): the grouped skinny-GU GEMM path.  The dequant pools switch from the 2-slot
+    // rings to per-expert pools so the skinny GU experts can be grouped into one G2 launch.  With E5
+    // on, the grouped path wins for the GU GEMMs (the E5 GU fused kernel is bypassed; the D side is
+    // unchanged).  The skinny range is STRATA_MOE_GEMM_TC_MAXNE (default 64).  Default off.
+    if (const char* gg = std::getenv("STRATA_MOE_GEMM_GROUPED"); gg && std::string(gg) == "1") {
+        m.moe_gu_grouped = true;
+    }
     const size_t T = (size_t) chunk;
     bool ok = true;
     Alloc o;
@@ -248,7 +270,20 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.Hh = o.take<uint16_t>(T * K * 640, ok); m.Dm = o.take<float>(T * K * N, ok);
     m.sgate = o.take<float>(T * 640, ok); m.sup = o.take<float>(T * 640, ok); m.sh_h = o.take<uint16_t>(T * 640, ok);
     m.shared = o.take<float>(T * N, ok); m.sg = o.take<float>(T, ok);
-    for (int i = 0; i < DQ; ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640, ok); }
+    if (m.moe_gu_grouped) {
+        // Stage 1.17: per-expert dequant pools (512 x 9.83 MB = 4.7 GB) + the grouped E-table.
+        // Plain cudaMalloc, NOT the borrow region: borrowing would carve ~4.7 GB out of the
+        // expert-cache pool (the borrow is bump-allocated from its trailing slots), stealing
+        // ~2,900 of the 8,000 slots and pushing ~19K more experts through the H2D staging path
+        // (measured: +31.9 GB H2D, +9.6 s compute-stream idle per 16K run).  +4.7 GB of VRAM
+        // (peak ~23.6 GB on the 32 GB V100) keeps the cache capacity identical to production.
+        if (cudaMalloc(&m.dqg_gu, (size_t) NE * GU_EL * sizeof(uint16_t)) != cudaSuccess) ok = false;
+        if (cudaMalloc(&m.dqg_d, (size_t) NE * D_EL * sizeof(uint16_t)) != cudaSuccess) ok = false;
+        if (cudaMalloc(&m.gu_etable_dev, (size_t) NE * sizeof(strata::prefill::GroupedExpert)) != cudaSuccess) ok = false;
+        m.gu_etable.resize(NE);
+    } else {
+        for (int i = 0; i < DQ; ++i) { m.dq_gu[i] = o.take<uint16_t>(GU_EL, ok); m.dq_d[i] = o.take<uint16_t>(D_EL, ok); }
+    }
     for (int i = 0; i < STAGE; ++i) {
         m.stage_dev[i] = o.take<uint8_t>((size_t) MAXBLOB(), ok);
         if (cudaHostAlloc((void**) &m.stage_host[i], (size_t) MAXBLOB(), cudaHostAllocDefault) != cudaSuccess) ok = false;
@@ -304,7 +339,9 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     f(T * NE); f(T * K); o.take<int32_t>(T * K, ok); o.take<int32_t>(T * K, ok); o.take<int32_t>(T * K, ok);
     o.take<uint16_t>(T * K * N, ok); f(T * K * 1280); o.take<uint16_t>(T * K * 640, ok); f(T * K * N);
     f(T * 640); f(T * 640); o.take<uint16_t>(T * 640, ok); f(T * N); f(T);
-    for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
+    // The grouped per-expert pools are plain cudaMalloc (not the borrow region - see init);
+    // the borrow only carries the 2-slot rings (the default path).
+    for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(GU_EL, ok); o.take<uint16_t>(D_EL, ok); }
     for (int i = 0; i < STAGE; ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
     f(T * N);
     f((size_t) strata::kernels::NG_HC_DIM);
@@ -597,59 +634,147 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         ++stats_.experts_streamed;
                         return true;
                     };
-                    size_t staged = 0;
-                    const size_t lookahead = STAGE - 1;
-                    for (size_t j = 0; j < order.size(); ++j) {
-                        while (staged < order.size() && staged <= j + lookahead) {
-                            if (!stage_one(staged)) return false;
-                            ++staged;
-                        }
-                        const int32_t e = order[j];
-                        const uint8_t* blob_dev = nullptr;
-                        if (stage_of[j] < 0) {
-                            blob_dev = m.cache->device_slot(m.host_res[(size_t) l * NE + e]);
-                            ++stats_.experts_resident;
-                        } else {
-                            cudaStreamWaitEvent(m.cs, m.copied[stage_of[j]], 0);
-                            blob_dev = m.stage_dev[stage_of[j]];
-                        }
-                        const int q = (int) (j % DQ);
-                        const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
-                        if (lay.native && m.moe_fuse) {
-                            // Stage 1.12 E5 (opt-in): dequant + GEMM in one kernel - no dq_gu/dq_d round trip.
-                            const auto& f = lay.fmt[(size_t) l];
-                            strata::kernels::moe_fused_gemm_gu(f.gu_type, blob_dev, blob_dev + f.up_off, ne, f.n_ff,
-                                                               f.n_embd, m.Xs + o0 * N, N, m.GU + o0 * 1280, 1280, m.cs);
-                        } else {
+                    if (m.moe_gu_grouped) {
+                        // ---- Stage 1.17 (opt-in, STRATA_MOE_GEMM_GROUPED=1): grouped skinny-GU GEMM ----
+                        // Phase 1: dequant ALL routed experts into the per-expert pools (indexed by
+                        // expert id).  Same blob staging / lifetime as the per-expert loop: the staging
+                        // slot is released after the dequants; the GEMMs below read the pools, not the
+                        // blobs.  (With E5 on, the grouped path wins for the GU GEMMs - the E5 GU fused
+                        // kernel is bypassed; the D side is unchanged.)
+                        size_t staged = 0;
+                        const size_t lookahead = STAGE - 1;
+                        for (size_t j = 0; j < order.size(); ++j) {
+                            while (staged < order.size() && staged <= j + lookahead) {
+                                if (!stage_one(staged)) return false;
+                                ++staged;
+                            }
+                            const int32_t e = order[j];
+                            const uint8_t* blob_dev = nullptr;
+                            if (stage_of[j] < 0) {
+                                blob_dev = m.cache->device_slot(m.host_res[(size_t) l * NE + e]);
+                                ++stats_.experts_resident;
+                            } else {
+                                cudaStreamWaitEvent(m.cs, m.copied[stage_of[j]], 0);
+                                blob_dev = m.stage_dev[stage_of[j]];
+                            }
                             if (lay.native) {
-                                // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
                                 const auto& f = lay.fmt[(size_t) l];
                                 if (m.moe_dq_wide) {
-                                    // Stage 1.14 (opt-in): wide-memory-op dequant (bit-identical to the baseline).
                                     strata::kernels::iq_dequant_gu_f16_wide(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
-                                                                             m.dq_gu[q], m.cs);
-                                    strata::kernels::iq_dequant_f16_wide(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs);
+                                                                             m.dqg_gu + (size_t) e * GU_EL, m.cs);
+                                    strata::kernels::iq_dequant_f16_wide(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff,
+                                                                         m.dqg_d + (size_t) e * D_EL, m.cs);
                                 } else {
                                     strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
-                                                                       m.dq_gu[q], m.cs);
-                                    strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs);
+                                                                       m.dqg_gu + (size_t) e * GU_EL, m.cs);
+                                    strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff,
+                                                                    m.dqg_d + (size_t) e * D_EL, m.cs);
                                 }
                             } else {
-                                blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);
+                                blob_dequant_f16(blob_dev, m.dqg_gu + (size_t) e * GU_EL, m.dqg_d + (size_t) e * D_EL, m.cs);
                             }
                             if (stage_of[j] >= 0) cudaEventRecord(m.used[stage_of[j]], m.cs);
-                            m.gemm.f16(m.Xs + o0 * N, m.dq_gu[q], m.GU + o0 * 1280, ne, 1280, N);
                         }
-                        swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
-                        if (lay.native && m.moe_fuse) {
-                            const auto& f = lay.fmt[(size_t) l];
-                            strata::kernels::moe_fused_gemm_d(f.d_type, blob_dev + f.down_off, ne, f.n_ff, f.n_embd,
-                                                              m.Hh + o0 * 640, 640, m.Dm + o0 * N, N, m.cs);
-                            if (stage_of[j] >= 0) cudaEventRecord(m.used[stage_of[j]], m.cs);
-                        } else {
-                            m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
+                        // The skinny experts (1 <= ne <= tc_max_ne) go into ONE grouped G2 launch.  The
+                        // table is in expert-id order, so the launch and its output are deterministic.
+                        int64_t tiles = 0;
+                        int G = 0;
+                        for (int32_t e = 0; e < NE; ++e) {
+                            const int ne = (int) m.cnt[(size_t) e];
+                            if (ne >= 1 && ne <= m.gemm.tc_max_ne()) {
+                                auto& et = m.gu_etable[(size_t) G];
+                                et.X = m.Xs + m.off[(size_t) e] * N;
+                                et.W = m.dqg_gu + (size_t) e * GU_EL;
+                                et.Y = m.GU + m.off[(size_t) e] * 1280;
+                                et.ne = ne;
+                                et.tile0 = (int) (tiles * 80);
+                                tiles += (ne + 15) / 16;
+                                ++G;
+                            }
+                        }
+                        if (G > 0) {
+                            if (cudaMemcpyAsync(m.gu_etable_dev, m.gu_etable.data(),
+                                                (size_t) G * sizeof(strata::prefill::GroupedExpert),
+                                                cudaMemcpyHostToDevice, m.cs) != cudaSuccess) {
+                                err = "prefill: grouped E-table H2D: " + std::string(cudaGetErrorString(cudaGetLastError()));
+                                return false;
+                            }
+                            m.gemm.gu_grouped((const strata::prefill::GroupedExpert*) m.gu_etable_dev, m.gu_etable.data(), G,
+                                              (int) tiles);
+                        }
+                        // The fat experts (ne > tc_max_ne) keep the per-expert GU GEMM (cuBLAS; the TC
+                        // guard in f16() excludes them).
+                        for (size_t j = 0; j < order.size(); ++j) {
+                            const int32_t e = order[j];
+                            const int64_t o0 = m.off[(size_t) e];
+                            const int ne = (int) m.cnt[(size_t) e];
+                            if (ne > m.gemm.tc_max_ne())
+                                m.gemm.f16(m.Xs + o0 * N, m.dqg_gu + (size_t) e * GU_EL, m.GU + o0 * 1280, ne, 1280, N);
+                        }
+                        // Phase 3: swiglu + D GEMM per expert (unchanged kernels).
+                        for (size_t j = 0; j < order.size(); ++j) {
+                            const int32_t e = order[j];
+                            const int64_t o0 = m.off[(size_t) e];
+                            const int ne = (int) m.cnt[(size_t) e];
+                            swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
+                            m.gemm.f16(m.Hh + o0 * 640, m.dqg_d + (size_t) e * D_EL, m.Dm + o0 * N, ne, N, 640);
+                        }
+                    } else {
+                        size_t staged = 0;
+                        const size_t lookahead = STAGE - 1;
+                        for (size_t j = 0; j < order.size(); ++j) {
+                            while (staged < order.size() && staged <= j + lookahead) {
+                                if (!stage_one(staged)) return false;
+                                ++staged;
+                            }
+                            const int32_t e = order[j];
+                            const uint8_t* blob_dev = nullptr;
+                            if (stage_of[j] < 0) {
+                                blob_dev = m.cache->device_slot(m.host_res[(size_t) l * NE + e]);
+                                ++stats_.experts_resident;
+                            } else {
+                                cudaStreamWaitEvent(m.cs, m.copied[stage_of[j]], 0);
+                                blob_dev = m.stage_dev[stage_of[j]];
+                            }
+                            const int q = (int) (j % DQ);
+                            const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
+                            if (lay.native && m.moe_fuse) {
+                                // Stage 1.12 E5 (opt-in): dequant + GEMM in one kernel - no dq_gu/dq_d round trip.
+                                const auto& f = lay.fmt[(size_t) l];
+                                strata::kernels::moe_fused_gemm_gu(f.gu_type, blob_dev, blob_dev + f.up_off, ne, f.n_ff,
+                                                                   f.n_embd, m.Xs + o0 * N, N, m.GU + o0 * 1280, 1280, m.cs);
+                            } else {
+                                if (lay.native) {
+                                    // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
+                                    const auto& f = lay.fmt[(size_t) l];
+                                    if (m.moe_dq_wide) {
+                                        // Stage 1.14 (opt-in): wide-memory-op dequant (bit-identical to the baseline).
+                                        strata::kernels::iq_dequant_gu_f16_wide(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
+                                                                                 m.dq_gu[q], m.cs);
+                                        strata::kernels::iq_dequant_f16_wide(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs);
+                                    } else {
+                                        strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
+                                                                           m.dq_gu[q], m.cs);
+                                        strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs);
+                                    }
+                                } else {
+                                    blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);
+                                }
+                                if (stage_of[j] >= 0) cudaEventRecord(m.used[stage_of[j]], m.cs);
+                                m.gemm.f16(m.Xs + o0 * N, m.dq_gu[q], m.GU + o0 * 1280, ne, 1280, N);
+                            }
+                            swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
+                            if (lay.native && m.moe_fuse) {
+                                const auto& f = lay.fmt[(size_t) l];
+                                strata::kernels::moe_fused_gemm_d(f.d_type, blob_dev + f.down_off, ne, f.n_ff, f.n_embd,
+                                                                  m.Hh + o0 * 640, 640, m.Dm + o0 * N, N, m.cs);
+                                if (stage_of[j] >= 0) cudaEventRecord(m.used[stage_of[j]], m.cs);
+                            } else {
+                                m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
+                            }
                         }
                     }
+
                     moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
                 }
                 // ---- the hyper-connection write of this half

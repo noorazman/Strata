@@ -227,6 +227,100 @@ bool tc_gemm_gu(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, cudaS
     return cudaGetLastError() == cudaSuccess;
 }
 
+// Stage 1.17 (STRATA_MOE_GEMM_GROUPED): the G2 grouped skinny-GU kernel.  ONE launch over all the
+// skinny experts of a chunk-layer: grid (80, total n16 tiles), block = 128 threads (4 warps).  Each
+// block owns one (expert, m16, n16) tile; the expert is found by a binary search over the table's
+// tile0 prefix (tile0 is in units of 80 m-blocks).  The tile body is the Stage 1.17 microbench S12
+// (the m16 x n16 tile beats the m16 x n128 S0 shape at ne <= 16 and is competitive at 17-64; W is
+// read once per GEMM).  The 4 warps split K (SUB = K/4 each); every k-warp accumulates its slice in
+// ascending k8 order and writes its partial to smem; the fixed-order reduce over the k-warps makes
+// the result deterministic.  X rows past ne are only READ by the last partial n16 tile (the outputs
+// are masked), so the caller keeps the 128-row Xs headroom.  ne <= 128 is guaranteed by the caller
+// (the tc_max_ne routing guard).
+__global__ void __launch_bounds__(128)
+g2_gu_kernel(const GroupedExpert* __restrict__ E, int G) {
+    const int l = threadIdx.x & 31, w = threadIdx.x >> 5;
+    const int t = blockIdx.y;
+    int lo = 0, hi = G;
+    while (lo < hi) {
+        const int mid = (lo + hi) >> 1;
+        if (E[mid].tile0 / 80 <= t) lo = mid + 1; else hi = mid;
+    }
+    const GroupedExpert Ee = E[lo - 1];
+    const int tel = t - Ee.tile0 / 80;
+    const int m0 = blockIdx.x * 16, n0 = tel * 16;
+    const int ne = Ee.ne;
+    const bool active = n0 < ne;
+    const int SUB = TC_K / 4, kbase = w * SUB;
+    const int row = (l & 3) + ((l >> 4) & 1) * 4;  // A row / B col, 0..7
+    const int64_t wa0 = (int64_t)(m0 + row) * TC_K + kbase, wa1 = wa0 + 8 * TC_K;
+    const int64_t xb0 = (int64_t)(n0 + row) * TC_K + kbase, xb1 = xb0 + 8 * TC_K;
+    const uint16_t* W = Ee.W;
+    const uint16_t* X = Ee.X;
+    float c0[2][2][8];
+    #pragma unroll
+    for (int mt = 0; mt < 2; ++mt)
+        #pragma unroll
+        for (int nt = 0; nt < 2; ++nt)
+            #pragma unroll
+            for (int ii = 0; ii < 8; ++ii) c0[mt][nt][ii] = 0.f;
+    if (active) {
+        struct Q { uint4 a0, a1, b0, b1; };
+        Q q[TC_QCACHE];
+        #pragma unroll
+        for (int d = 0; d < TC_QCACHE; ++d) {
+            const int off = d * 8;
+            q[d].a0 = *(const uint4*)&W[wa0 + off];
+            q[d].a1 = *(const uint4*)&W[wa1 + off];
+            q[d].b0 = *(const uint4*)&X[xb0 + off];
+            q[d].b1 = *(const uint4*)&X[xb1 + off];
+        }
+        const int NWIN = SUB / 8;
+        for (int t2 = 0; t2 < NWIN; ++t2) {
+            const int slot = t2 & (TC_QCACHE - 1);
+            const int koff = t2 * 8 + TC_QCACHE * 8;
+            tc_mma816(c0[0][0], q[slot].a0.x, q[slot].a0.y, q[slot].b0.x, q[slot].b0.y);
+            tc_mma816(c0[1][0], q[slot].a1.x, q[slot].a1.y, q[slot].b0.x, q[slot].b0.y);
+            tc_mma816(c0[0][0], q[slot].a0.z, q[slot].a0.w, q[slot].b0.z, q[slot].b0.w);
+            tc_mma816(c0[1][0], q[slot].a1.z, q[slot].a1.w, q[slot].b0.z, q[slot].b0.w);
+            tc_mma816(c0[0][1], q[slot].a0.x, q[slot].a0.y, q[slot].b1.x, q[slot].b1.y);
+            tc_mma816(c0[1][1], q[slot].a1.x, q[slot].a1.y, q[slot].b1.x, q[slot].b1.y);
+            tc_mma816(c0[0][1], q[slot].a0.z, q[slot].a0.w, q[slot].b1.z, q[slot].b1.w);
+            tc_mma816(c0[1][1], q[slot].a1.z, q[slot].a1.w, q[slot].b1.z, q[slot].b1.w);
+            if (koff < SUB) {
+                q[slot].a0 = *(const uint4*)&W[wa0 + koff];
+                q[slot].a1 = *(const uint4*)&W[wa1 + koff];
+                q[slot].b0 = *(const uint4*)&X[xb0 + koff];
+                q[slot].b1 = *(const uint4*)&X[xb1 + koff];
+            }
+        }
+    }
+    const int rb = (l & 1) + 4 * ((l >> 4) & 1);
+    const int cb = 2 * ((l >> 1) & 1);
+    __shared__ float part[4][16][16];
+    #pragma unroll
+    for (int mt = 0; mt < 2; ++mt)
+        #pragma unroll
+        for (int nt = 0; nt < 2; ++nt)
+            #pragma unroll
+            for (int ii = 0; ii < 8; ++ii) {
+                const int r = rb + 2 * ((ii >> 1) & 1);
+                const int c = cb + 4 * ((ii >> 2) & 1) + (ii & 1);
+                part[w][mt * 8 + r][nt * 8 + c] = c0[mt][nt][ii];
+            }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < 256; idx += 128) {
+        const int n16 = idx >> 4, m16 = idx & 15;
+        const int gn = n0 + n16;
+        if (gn < ne) {
+            float s = 0.f;
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) s += part[k][m16][n16];
+            Ee.Y[(int64_t) gn * TC_M + (m0 + m16)] = s;
+        }
+    }
+}
+
 // Stage 1.16 debug (STRATA_MOE_GEMM_TC_VERIFY): count nneq and max |a-b| between two f32 arrays.
 __global__ void tc_verify_cmp(const float* Y, const float* ref, int n, float* nneq_f, float* maxabs_f) {
     unsigned cnt = 0;
@@ -403,6 +497,37 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
                     CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
        "cublasGemmEx f16");
+}
+
+void Gemm::gu_grouped(const GroupedExpert* etab_dev, const GroupedExpert* etab, int G, int total_tiles) {
+    if (G <= 0 || total_tiles <= 0) return;
+    const float alpha = 1.0f, beta = 0.0f;
+    const int64_t ntot = (int64_t) total_tiles;  // grid.y bound
+    const dim3 g(TC_M / 16, (int) ntot);
+    g2_gu_kernel<<<g, 128, 0, (cudaStream_t) stream_>>>(etab_dev, G);
+    if (tc_verify_ && etab) {
+        // Debug: co-compute the cuBLAS reference for the first few skinny experts into the dequant
+        // scratch and compare against the G2 outputs (same hook semantics as the per-call TC verify).
+        const int nv = (G < 8) ? G : 8;
+        float* ref = (float*) scratch_;
+        cudaMemsetAsync(verify_dev_, 0, 2 * sizeof(float), (cudaStream_t) stream_);
+        static long batches = 0;
+        ++batches;
+        for (int e = 0; e < nv; ++e) {
+            const GroupedExpert& x = etab[e];
+            ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, TC_M, x.ne, TC_K, &alpha, x.W,
+                            CUDA_R_16F, TC_K, x.X, CUDA_R_16F, TC_K, &beta, ref, CUDA_R_32F, TC_M,
+                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+               "cublasGemmEx g2_verify");
+            tc_verify_cmp<<<8, 256, 0, (cudaStream_t) stream_>>>(x.Y, ref, x.ne * TC_M, verify_dev_, verify_dev_ + 1);
+        }
+        float hv[2] = {0.0f, 0.0f};
+        cudaMemcpyAsync(hv, verify_dev_, 2 * sizeof(float), cudaMemcpyDeviceToHost, (cudaStream_t) stream_);
+        cudaStreamSynchronize((cudaStream_t) stream_);
+        if (hv[0] != 0.0f || batches <= 20) {
+            std::fprintf(stderr, "[g2_verify] batch %ld experts=%d nneq=%.0f maxAbs=%.3e\n", batches, nv, hv[0], hv[1]);
+        }
+    }
 }
 
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,

@@ -11,6 +11,16 @@
 
 namespace strata::prefill {
 
+/// Stage 1.17: one row of the grouped skinny-GU table.  `tile0` is the n16-tile prefix in units of
+/// 80 m-blocks (the G2 grid is (80, total n16 tiles)); `tile0 / 80` is the expert's first n16 tile.
+struct GroupedExpert {
+    const uint16_t* X;  // [ne, 2560] f16 activation rows (row-major)
+    const uint16_t* W;  // [1280, 2560] f16 dequantized gate/up weight (row-major)
+    float* Y;           // [ne, 1280] f32 output (row-major)
+    int ne;             // rows (1..128)
+    int tile0;          // 80 x (n16 tile prefix)
+};
+
 class Gemm {
 public:
     Gemm() = default;
@@ -36,9 +46,18 @@ public:
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                 int64_t ldy = 0, float beta = 0.0f);
 
+    /// Stage 1.17: one launch over `G` skinny GU experts (the G2 grouped kernel, m16 x n16 tiles,
+    /// 4-way in-block k-split, deterministic smem reduce).  `etab_dev` = the device copy of `etab`
+    /// (only the first `G` rows), already on the stream; `total_tiles` = sum over the rows of
+    /// ceil(ne / 16).  Shape is fixed (N = 1280, K = 2560, ldy = 1280).  `etab` (host) is used only
+    /// for the STRATA_MOE_GEMM_TC_VERIFY co-computation and may be null.
+    void gu_grouped(const GroupedExpert* etab_dev, const GroupedExpert* etab, int G, int total_tiles);
+
     uint16_t* scratch() const { return scratch_; }
     int64_t scratch_elems() const { return scratch_elems_; }
     void* stream() const { return stream_; }
+    int tc_max_ne() const { return (int) tc_max_ne_; }
+    bool tc_verify_on() const { return tc_verify_; }
 
 private:
     void* handle_ = nullptr;
