@@ -1,0 +1,2 @@
+[bench] r2x-det1-32768-dev2: gpu0 free 32764 MiB; ok
+[bench] r2x-det1-32768-dev2: rc=1 wall=0.8s decode=- tok/s (? tok / ? ms) prefill=- tok/s TTFT=- ms peakVRAM=312 MiB cpuMean=3.3% peakGPU=2%

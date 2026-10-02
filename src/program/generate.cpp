@@ -14,6 +14,7 @@
 // AND IT IS PHASE 2, so hit rate is `h = 0` and the number it prints is slow on purpose
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
+#include "strata/core/devices.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
@@ -120,6 +121,7 @@ struct Options {
     bool ple_sync_submit = false;      ///< A/B arm: submit reads on the token thread, no I/O worker
     int ple_ram_threads = 16;          ///< Ram mode: preload read threads (1 = single-threaded)
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
+    std::string devices;               ///< Release 2 phase 1: device spec, "" (default = env or "0") or "0,2"
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
     /// bf16 projections and the stream mean) recompute cheaply in Python, and only the 794 MB GEMV does not.
@@ -290,6 +292,8 @@ void usage() {
                  "  --expert-cache-cpu-order  experimental GPU expert reduction matching CPU order\n"
                  "  --max-new N          tokens to generate (default 16)\n"
                  "  --max-context N      KV/state capacity (default 4096)\n"
+                  "  --devices A[,B]      GPU ordinals: A is the primary (compute), the rest auxiliary\n"
+                  "                       (Release 2 phase 1; default $STRATA_DEVICES or 0)\n"
                  "  --greedy             argmax (the default)\n"
                  "  --seed S             enable sampling with this Philox seed\n"
                  "  --top-k N --top-p F --temperature F\n"
@@ -485,6 +489,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--max-new") o.max_new = std::atoll(next("--max-new"));
         else if (a == "--max-context") o.max_context = std::atoll(next("--max-context"));
+        else if (a == "--devices") o.devices = next("--devices");
         else if (a == "--greedy") o.greedy = true;
         else if (a == "--seed") { o.seed = (uint64_t) std::atoll(next("--seed")); o.greedy = false; }
         else if (a == "--top-k") o.top_k = std::atoi(next("--top-k"));
@@ -757,6 +762,35 @@ int main(int argc, char** argv) {
         if (!native_pack) skip.erase("blk.1.ple_key.weight");
         if (native_pack) skip.insert("token_embd.weight");
     }
+
+    // ---- Release 2, phase 1: the DEVICE PLAN, BEFORE THE FIRST ALLOCATION.
+    //
+    // `--devices A[,B]` (or $STRATA_DEVICES, or the Release 1 default of "0") names the primary device A -
+    // the one the compute stays on for the whole run - and any auxiliary devices.  Phase 1 only builds the
+    // plan (per-device facts, peer connections enabled, one startup report line) and pins the primary
+    // explicitly, so the default run is byte-for-byte the Release 1 run: same device, same allocations,
+    // same numerics - verified by the Release 1 determinism anchor.  Phase 2 is what actually moves the
+    // context-scaling state (the QSA KV cache + block-pooled indexer + RoPE tables) onto the auxiliary
+    // device; it consumes this plan, which is why the peer connections are established HERE, before any
+    // pointer into a second device's memory can be dereferenced, and why the report says what is directly
+    // addressable from what (a pair without p2p must be staged through the host - the report names it).
+    const char* devices_env = std::getenv("STRATA_DEVICES");
+    const std::string devices_spec = o.devices.empty() ? (devices_env ? devices_env : "0") : o.devices;
+    strata::core::DevicePlan devices;
+    try {
+        devices = strata::core::make_device_plan(devices_spec, /*probe_bandwidth=*/false);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "strata generate: device plan: %s\n", e.what());
+        return 1;
+    }
+    if (cudaSetDevice(devices.primary()) != cudaSuccess) {
+        std::fprintf(stderr, "strata generate: cudaSetDevice(%d) for the primary failed: %s\n",
+                     devices.primary(), cudaGetErrorString(cudaGetLastError()));
+        return 1;
+    }
+    std::fprintf(stderr, "%s\n", strata::core::device_plan_report(devices).c_str());
+    (void) devices;   // phase 2 reads the plan from here; phase 1 keeps it alive so the run cannot lose it
+
     uint64_t pool_bytes = 0;
     if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());

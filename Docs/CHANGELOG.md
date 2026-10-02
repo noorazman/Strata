@@ -2,6 +2,32 @@
 
 Important historical changes and decisions. No raw logs.
 
+## 2026-10-02 — V100 Release 2, phase 1: multi-device foundation (`--devices`, P2P plan + report)
+
+Release 2 goal (user-directed): run the engine multi-GPU — final target `cuda:0`+`cuda:1` (two
+32 GB V100s), development pair `cuda:0`+`cuda:2` (32 GB PCIe + 16 GB SXM2; GPU1's 32 GB hosts
+the resident llama-server tenant). Phase 1 is the FOUNDATION only: `include/strata/core/devices.hpp`
+(new) + `src/core/device.cu` — `DevicePlan` from a `--devices A[,B]` spec (or `STRATA_DEVICES`,
+default `0`): per-device `device_info` (sm_70 floor on every card), pairwise
+`cudaDeviceCanAccessPeer` + `cudaDeviceEnablePeerAccess` BEFORE the first allocation (peer enable
+at plan time, so no pointer into a second device can be dereferenced early), a directed
+`p2p[i][j]` matrix (asymmetric PCIe P2P stays visible), and a timed `cudaMemcpyPeer` bandwidth
+probe (self-test only, so a boot stays fast). `src/program/generate.cpp` builds the plan before
+the first `cudaMalloc`, pins the primary explicitly, and prints one report line; the plan stays
+alive for phase 2 (placing the QSA KV/indexer/RoPE state on the aux device). `strata-device`
+gains `--devices`/`--p2p` and a cross-device selftest (1 MiB pattern copy + verify, staged when
+p2p is off). MEASURED on this box: GPU0↔GPU2 P2P = **none** at driver level (different NUMA
+nodes, no NVLink) → phase 2 stages through the host on the dev pair; the 0,1 probe waits for
+the GPU1 tenant to move. Ordinal semantics: `--devices` is in the `CUDA_VISIBLE_DEVICES`
+(post-remap) namespace — the multi-GPU service extends the unit's env var, the spec stays
+`0,1`. Gates: build clean; `strata-device --devices 0,2 --p2p --selftest` PASS (aux arena +
+staged cross-device copy verified); engine default devices = Release 1 det anchor
+(cdb7f7d056f339ba704d3bb9620a1dec, golden 271) and engine with two devices visible
+(`CUDA_VISIBLE_DEVICES=0,2 --devices 0,1`) **byte-identical** to the default arm — the
+foundation changes no numerics. Service restarted, /health 786432 + images true. Doc:
+`Docs/v100-release2-phase1.md`. No production config change in phase 1 (default `--devices 0`);
+phase 2 moves state.
+
 ## 2026-10-02 — Post-release amendment: production context 32K → 786,432 + vision, on the frozen tag `v100-release1`
 
 User request: raise the production max-context toward ~1M tokens and enable vision on the same

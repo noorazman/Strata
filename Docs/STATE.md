@@ -92,10 +92,36 @@ with the encoder resident peaks at 31,830 MiB (938 MiB margin), rc=0, zero error
 carries `--max-context 786432` + `--vision` + the `"vision"` entry; the systemd unit is unchanged. Details,
 measured tables and service validation: `Docs/v100-release1.md` §9 + CHANGELOG top entry.
 
+## Release 2, phase 1 (2026-10-02): multi-device foundation — DONE
+**Release 2 goal (user-directed): run the engine multi-GPU** — final target `cuda:0`+`cuda:1`
+(two 32 GB V100s); development pair `cuda:0`+`cuda:2` (32 GB + 16 GB SXM2; GPU1's 32 GB hosts the
+resident llama-server tenant, so it is unusable until that moves). Phase 1 (foundation, no numerics
+touched) is SHIPPED: `--devices A[,B]` / `STRATA_DEVICES` (default `0`) builds a `DevicePlan`
+(`include/strata/core/devices.hpp`, `src/core/device.cu`) before the first allocation — per-device
+facts (sm_70 floor on every card), pairwise P2P enable at plan time, a directed `p2p[i][j]` matrix,
+a timed D2D bandwidth probe (self-test only) — `generate.cpp` pins the primary and prints one report
+line, and `strata-device` gained `--devices`/`--p2p` + a cross-device selftest. MEASURED on this box:
+GPU0↔GPU2 P2P = **none** (different NUMA nodes, no NVLink) → phase 2 stages through the host on the
+dev pair; the 0,1 probe waits for the GPU1 tenant. Ordinals are in the `CUDA_VISIBLE_DEVICES`
+(post-remap) namespace, so the multi-GPU service extends the unit env var and the spec stays `0,1`.
+Gates: build clean; `strata-device --devices 0,2 --p2p --selftest` PASS (aux arena + staged cross-device
+copy verified); engine default devices = Release 1 det anchor (cdb7f7d0…, golden 271) and the two-device
+arm (`CUDA_VISIBLE_DEVICES=0,2 --devices 0,1`) **byte-identical** to the default arm. No production config
+change (default `--devices 0`). Doc: `Docs/v100-release2-phase1.md`.
+
 ## Next action (exactly one)
-**Post-release amendment SHIPPED (2026-10-02): production max-context 786,432 + vision, service live on 8180**
-(`strata.service` restarted with the new config; `/health` max_context 786432 + images true; live image and
-text requests verified — see `Docs/v100-release1.md` §9.3). Do NOT begin Release 2 work until directed.
+**Release 2, phase 2: move the context-scaling QSA state to the auxiliary device** — take the `DevicePlan`
+phase 1 built and place the QSA KV cache (int8 k_q/v_q + scales), the block-pooled indexer state
+(idx_tail/idx_dead/idx_pooled) and the shared RoPE tables on the aux card, re-capturing the layer graphs;
+keep the GDN recurrent state, MoE buffers, block buffers and PLE history on the primary. On the current
+dev pair P2P is `none`, so use host staging (the path the phase 1 selftest already verifies); per-token
+remote volume is bounded by QSA's selection (≤ `idx_top_k + idx_block - 1` = 2,051 cells, not the full
+context). Target: 786,432 KV (9.3 GiB) fits the 16 GB SXM2 with room for the indexer state — the first
+context step a single 32 GB card cannot serve at the full 8K expert cache. Re-run the P2P probe on the
+final 0,1 pair once the GPU1 tenant moves (a P2P-capable 32+32 pair doubles staging bandwidth for free).
+Regression gate stays the Release 1 determinism anchor (det md5 cdb7f7d0…, golden 271) plus a two-device
+byte-identical arm.
+
 Deferred (post-Release-4, per the mission stop rule — do not optimize against benchmark headroom before
 then): MoE GEMM/DMA levers in measured order from Stage 1.17 (deeper DMA staging ~54 MB for 32 in-flight
 slots; smem-staged G2b for the L1-queue stall; grouped D GEMM), plus the E8 14K-slot cache +

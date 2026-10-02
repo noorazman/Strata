@@ -1,9 +1,11 @@
 // src/core/device.cu - P2.S1: the CUDA side of the runtime core.
 #include "strata/core/device.hpp"
+#include "strata/core/devices.hpp"
 
 #include <cuda_runtime.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace strata::core {
@@ -114,6 +116,158 @@ void* DeviceArena::alloc(uint64_t bytes, uint64_t align) {
     }
     used_ = start + bytes;
     return (char*) base_ + start;
+}
+
+// ================================ Release 2, phase 1: the multi-device plan ================================
+
+int DevicePlan::index_of(int ordinal) const {
+    for (size_t i = 0; i < ordinals.size(); ++i)
+        if (ordinals[i] == ordinal) return (int) i;
+    return -1;
+}
+
+namespace {
+
+std::vector<int> parse_device_spec(const std::string& spec) {
+    std::vector<int> out;
+    size_t start = 0;
+    while (start <= spec.size()) {
+        const size_t comma = spec.find(',', start);
+        std::string tok = (comma == std::string::npos) ? spec.substr(start) : spec.substr(start, comma - start);
+        const size_t a = tok.find_first_not_of(" \t"), b = tok.find_last_not_of(" \t");
+        if (a == std::string::npos) throw CudaError("empty device ordinal in spec '" + spec + "'", -1);
+        tok = tok.substr(a, b - a + 1);
+        char* endp = nullptr;
+        const long v = std::strtol(tok.c_str(), &endp, 10);
+        if (endp == tok.c_str() || *endp != '\0' || v < 0 || v > 127) {
+            throw CudaError("bad device ordinal '" + tok + "' in spec '" + spec + "'", -1);
+        }
+        out.push_back((int) v);
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+    return out;
+}
+
+/// The measured device-to-device bandwidth of one ENABLED pair, in GB/s: 128 MiB blocks of `cudaMemcpyPeer`
+/// from src to dst, repeated until at least 250 ms of transfers have run (a single copy is too short to
+/// average out the PCIe arbitration noise on this box) and capped at 1 GiB of measured traffic.  The events
+/// live on the SOURCE device: `cudaMemcpyPeer` runs from the source's context, and every iteration
+/// synchronises the stop event, so after the loop `a`/`b` span exactly the measured copies.
+double measure_p2p_gbps(int src, int dst) {
+    // The ordinals are MEMBERS, not references to the enclosing function's parameters: in a .cu file a
+    // non-trivial destructor is compiled for device use as well, where enclosing-function locals are
+    // out of reach, and the reference is exactly the error that costs the build.
+    struct Guard {
+        int src = -1, dst = -1;
+        void* s = nullptr;
+        void* d = nullptr;
+        cudaEvent_t a = nullptr, b = nullptr;
+        ~Guard() {
+            if (a) cudaEventDestroy(a);
+            if (b) cudaEventDestroy(b);
+            if (d) { cudaSetDevice(dst); cudaFree(d); }
+            if (s) { cudaSetDevice(src); cudaFree(s); }
+        }
+    } g;
+    g.src = src;
+    g.dst = dst;
+    const uint64_t bytes = 128ull << 20;
+    check(cudaSetDevice(src), "cudaSetDevice(src)");
+    check(cudaMalloc(&g.s, (size_t) bytes), "p2p probe: cudaMalloc on the source");
+    check(cudaSetDevice(dst), "cudaSetDevice(dst)");
+    check(cudaMalloc(&g.d, (size_t) bytes), "p2p probe: cudaMalloc on the destination");
+    // Seed the source with a pattern, not zeros: a pattern makes a transfer that silently moves nothing
+    // visible if this probe is ever run by hand.
+    check(cudaMemset(g.s, 0x5a, (size_t) bytes), "p2p probe: seed");
+    check(cudaSetDevice(src), "cudaSetDevice(src) again");
+    check(cudaEventCreate(&g.a), "p2p probe: event a");
+    check(cudaEventCreate(&g.b), "p2p probe: event b");
+    check(cudaMemcpyPeer(g.d, dst, g.s, src, (size_t) bytes), "p2p probe: warmup");
+    check(cudaEventRecord(g.a, 0), "p2p probe: event a record");
+    uint64_t measured = 0;
+    for (;;) {
+        check(cudaMemcpyPeer(g.d, dst, g.s, src, (size_t) bytes), "p2p probe: copy");
+        measured += bytes;
+        check(cudaEventRecord(g.b, 0), "p2p probe: event b record");
+        check(cudaEventSynchronize(g.b), "p2p probe: event b sync");
+        float ms = 0;
+        check(cudaEventElapsedTime(&ms, g.a, g.b), "p2p probe: elapsed");
+        if (ms >= 250.0f || measured >= (uint64_t) (1 << 30)) break;
+    }
+    float ms = 0;
+    check(cudaEventElapsedTime(&ms, g.a, g.b), "p2p probe: elapsed final");
+    return (double) measured / (ms / 1000.0) / 1e9;
+}
+
+}  // namespace
+
+DevicePlan make_device_plan(const std::string& spec, bool probe_bandwidth) {
+    const std::vector<int> ordinals = parse_device_spec(spec);
+    if (ordinals.empty()) throw CudaError("empty device spec", -1);
+    for (size_t i = 0; i < ordinals.size(); ++i)
+        for (size_t j = i + 1; j < ordinals.size(); ++j)
+            if (ordinals[i] == ordinals[j]) {
+                throw CudaError("duplicate ordinal " + std::to_string(ordinals[i]) + " in spec '" + spec + "'", -1);
+            }
+
+    DevicePlan plan;
+    plan.ordinals = ordinals;
+    for (int o : ordinals) plan.info.push_back(device_info(o));      // throws on a card below sm_70
+    const size_t n = ordinals.size();
+    plan.p2p.assign(n, std::vector<int>(n, 0));
+    plan.p2p_gbps.assign(n, std::vector<double>(n, 0.0));
+    for (size_t i = 0; i < n; ++i) plan.p2p[i][i] = 1;
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = 0; j < n; ++j) {
+            if (i == j) continue;
+            int can = 0;
+            check(cudaDeviceCanAccessPeer(&can, ordinals[i], ordinals[j]), "cudaDeviceCanAccessPeer");
+            if (!can) continue;
+            // Enable from i's context, addressing j: i's kernels may then dereference j's pointers directly.
+            check(cudaSetDevice(ordinals[i]), "cudaSetDevice for the peer enable");
+            const cudaError_t e = cudaDeviceEnablePeerAccess(ordinals[j], 0);
+            if (e != cudaSuccess && e != cudaErrorAlreadyAcquired) {
+                throw CudaError("cudaDeviceEnablePeerAccess: device " + std::to_string(ordinals[i]) +
+                                    " cannot address device " + std::to_string(ordinals[j]) + ": " +
+                                    cudaGetErrorString(e),
+                                (int) e);
+            }
+            plan.p2p[i][j] = 1;
+            if (probe_bandwidth) plan.p2p_gbps[i][j] = measure_p2p_gbps(ordinals[i], ordinals[j]);
+        }
+    }
+    return plan;
+}
+
+std::string device_plan_report(const DevicePlan& plan) {
+    auto human = [](uint64_t b) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.2f GiB", (double) b / (1024.0 * 1024 * 1024));
+        return std::string(buf);
+    };
+    std::string s = "strata devices: ";
+    for (size_t i = 0; i < plan.ordinals.size(); ++i) {
+        const DeviceInfo& d = plan.info[i];
+        if (i) s += "; ";
+        s += (i == 0 ? "primary " : "aux ") + std::to_string(d.ordinal) + " (" + d.name + ", sm_" +
+             std::to_string(d.cc_major) + std::to_string(d.cc_minor) + ", " + human(d.free_bytes) + " free / " +
+             human(d.total_bytes) + " total)";
+    }
+    s += "; p2p ";
+    bool any = false;
+    for (size_t i = 0; i < plan.p2p.size(); ++i)
+        for (size_t j = 0; j < plan.p2p.size(); ++j) {
+            if (i == j || !plan.p2p[i][j]) continue;
+            if (any) s += ", ";
+            s += std::to_string(plan.ordinals[i]) + "->" + std::to_string(plan.ordinals[j]) +
+                 (plan.p2p_gbps[i][j] > 0 ? " (" + std::to_string((long long) (plan.p2p_gbps[i][j] * 100 + 0.5)) +
+                                                " MB/s)"
+                                          : std::string());
+            any = true;
+        }
+    if (!any) s += "none";
+    return s;
 }
 
 }  // namespace strata::core

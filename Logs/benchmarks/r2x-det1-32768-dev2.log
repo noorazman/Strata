@@ -1,0 +1,3 @@
+strata generate: this CPU has no AVX-512: the expert kernels run on AVX2
+strata generate: native pack: packs/swift-iq3_xxs experts (largest blob 2.33 MB), token embedding type 21 in mapped host memory (260 MiB)
+strata generate: device plan: device ordinal 2 is out of range (have 1)
