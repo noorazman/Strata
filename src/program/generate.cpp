@@ -2195,10 +2195,7 @@ int main(int argc, char** argv) {
         }
         ss.ple.emb_dev = ple_emb_dev;
         ss.ple.scratch = ple_scratch;
-        if (!ss.ple.ready()) {
-            std::fprintf(stderr, "strata generate: the PLE run is not ready after construction\n");
-            return 1;
-        }
+        // (the ready() check itself waits for session_init, which carves the history - the wiring lands there)
         std::fprintf(stderr, "strata generate: PLE on, table %llu rows of %s (PLE I/O mode: %s)\n",
                      (unsigned long long) ple_table.rows(), o.ple_gguf.c_str(), o.ple_io.c_str());
     } else {
