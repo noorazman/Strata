@@ -1,0 +1,34 @@
+{
+ "workers": 24,
+ "mtp_mib": 1985.0,
+ "label": "r1x-ctx1M-fill",
+ "gpu": 0,
+ "max_new": 128,
+ "max_context": 1048576,
+ "kv": "int8",
+ "n_prompt": 1047312,
+ "wall_s": 1508.9,
+ "engine_rc": 124,
+ "peak_vram_mib": 32298,
+ "peak_gpu_util": 100,
+ "mem_before": {
+  "mem_total_gib": 125.77681350708008,
+  "mem_available_gib": 104.91508865356445,
+  "cached_gib": 56082548.33706665
+ },
+ "mem_after": {
+  "mem_total_gib": 125.77681350708008,
+  "mem_available_gib": 104.59619903564453,
+  "cached_gib": 37045829.032196045
+ },
+ "command_tail": "--expert-cache auto --prefill 2048 --spec 4 --spec-min-p 0.5 --pool-workers 24 --mtp mtp/rt --max-context 1048576 --kv int8 --max-new 128 --tokens-file bench/v100/fill-1047312.tok --stats",
+ "cpu": {
+  "cpu_total_mean_pct": 10.0,
+  "cpu_total_peak_pct": 100.0,
+  "cpu_core_mean_pct": 10.0,
+  "cpu_core_peak_pct": 100.0,
+  "cores_mean_ge50pct": [
+   "0:93%"
+  ]
+ }
+}

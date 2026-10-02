@@ -78,5 +78,26 @@ CUDA_VISIBLE_DEVICES=0 LD_LIBRARY_PATH=/usr/local/cuda/lib64 timeout 900 ./build
 4. Reference engines: `ik_llama.cpp` fork crashes on this box at CUDA init; vanilla llama.cpp build `/home/noorazman/llama.cpp/build` (bin `llama-completion`, use `-no-cnv`) is the working cross-check.
 5. Notifications: `~/.dsh/bin/dsh-notify "text"` at milestones (Telegram bot may report offline — mention once, keep using).
 
+## Post-release amendment (2026-10-02): production context 32K → 786,432 + vision
+**Release 1 is still SHIPPED and frozen at tag `v100-release1` (7a901c7).** On user request the production
+max-context was raised toward 1M and vision enabled, measured on the frozen baseline and applied as a new
+commit on top (tag untouched). Result: **1,048,576 fits text-only** (full 1,047,312-token fill: peak
+32,494/32,768 MiB, 274 MiB margin, prefill 269.12 tok/s / TTFT 64.9 min, decode 30.17 tok/s @128, clean)
+**but OOMs with the resident vision encoder** (1,206 MiB footprint; live co-tenant cudaMalloc failure) →
+production now runs **786,432 + `--vision` + the resident GPU0 encoder** (`strata-vision`,
+`build-vision/bin/strata-vision`, SM70 CUDA, llama.cpp mtmd pinned 3cf03257,
+`tools/vision/strata_vision.cpp`; mmproj
+`/mnt/ssd/llm_models/Qwen3.8-Flash-Next-GGUF/mmproj-Qwen3.8-Flash-Next-F16.gguf`): full 785,484-token fill
+with the encoder resident peaks at 31,830 MiB (938 MiB margin), rc=0, zero errors. `strata-swift-iq3_xxs.json`
+carries `--max-context 786432` + `--vision` + the `"vision"` entry; the systemd unit is unchanged. Details,
+measured tables and service validation: `Docs/v100-release1.md` §9 + CHANGELOG top entry.
+
 ## Next action (exactly one)
-**Release 1 is SHIPPED and frozen (tag `v100-release1`) — all 14 gates PASS.** `strata.service` is running the Release 1 config (production 32 K / int8 / 8180 + `STRATA_MOE_DQ_WIDE=1`) and verified live. Do NOT begin Release 2 work until directed. Deferred (post-Release-4, per the mission stop rule — do not optimize against benchmark headroom before then): MoE GEMM/DMA levers in measured order from Stage 1.17 (deeper DMA staging ~54 MB for 32 in-flight slots; smem-staged G2b for the L1-queue stall; grouped D GEMM), plus the E8 14K-slot cache + production-traffic profile (Stage 1.13 follow-up: H2D −63.5 %, TTFT −4.3/−5.4 %, decode neutral, VRAM −9.2 GB margin).
+**Post-release amendment SHIPPED (2026-10-02): production max-context 786,432 + vision, service live on 8180**
+(`strata.service` restarted with the new config; `/health` max_context 786432 + images true; live image and
+text requests verified — see `Docs/v100-release1.md` §9.3). Do NOT begin Release 2 work until directed.
+Deferred (post-Release-4, per the mission stop rule — do not optimize against benchmark headroom before
+then): MoE GEMM/DMA levers in measured order from Stage 1.17 (deeper DMA staging ~54 MB for 32 in-flight
+slots; smem-staged G2b for the L1-queue stall; grouped D GEMM), plus the E8 14K-slot cache +
+production-traffic profile (Stage 1.13 follow-up: H2D −63.5 %, TTFT −4.3/−5.4 %, decode neutral, VRAM −9.2 GB
+margin).

@@ -228,3 +228,72 @@ sudo systemctl start strata
 - Gate harness: `bench/v100/r1gates.sh` (this release's engine-level gates).
 - Service unit: `Docs/strata.service` (installed to `/etc/systemd/system/strata.service`,
   carries `Environment=STRATA_MOE_DQ_WIDE=1`).
+
+## 9. Post-release amendment (2026-10-02): 786,432 context + vision, same frozen baseline
+
+The Release 1 baseline stays frozen at tag `v100-release1` (7a901c7). On user request, two
+production-capacity changes were measured and applied on top of the frozen tag (a new commit —
+the tag is untouched): the max-context raised toward 1M, and vision (image understanding via
+the mmproj encoder) enabled — both on the same 1× V100 32 GB (GPU0). No engine code changed;
+the `--vision` path (M-RoPE position table + GENI/SVE1 image requests, generate.cpp) and the
+serve-layer `Vision` encoder plumbing (server.py) already existed in the baseline.
+
+### 9.1 What fits (measured, not estimated)
+
+| Config | KV / session | Peak VRAM | Outcome |
+|---|---|---|---|
+| 1,048,576 ctx, int8 KV, text-only, full 1,047,312-token prefill + 128 decode | session_bytes 15,297,861,120 B (14.16 GiB); int8 KV 13,287,555,072 B (12.38 GiB) + QSA states 2.57 GiB | **32,494 MiB / 32,768 (274 MiB margin)** | **PASS** — prefill 1,047,311 tokens @ 269.12 tok/s (TTFT 64.9 min), decode 128 tokens @ 30.17 tok/s, clean exit, zero CUDA errors, expert-cache hit rate 79.87 % |
+| 1,048,576 ctx + resident vision encoder | same | ~33.7 GiB (32,494 + 1,206 MiB encoder) | **FAIL** — live co-tenant OOM: the mmproj's 862.11 MiB cudaMalloc failed while the 1M fill held 32,298–32,494 MiB |
+| 786,432 ctx, int8 KV, `--vision` + resident vision encoder (keep-alive encode every 20 s), full 785,484-token prefill + 128 decode | session_bytes 11,505,137,152 B (10.70 GiB); int8 KV 9,965,666,304 B (9.29 GiB) + QSA states 1.93 GiB | **31,830 MiB / 32,768 (938 MiB margin)** | **PASS** — prefill 785,483 tokens / 384 chunks @ 305.74 tok/s (TTFT 42.8 min), decode 128 tokens @ 33.70 tok/s with the encoder resident (136 keep-alive encodes, 59–145 ms each), rc=0, zero errors |
+
+Note the expert-cache interaction: at 1M the auto-sizing truncates the 8,000-slot profile to
+6,884 slots (11.12 GiB) to fit; at 786,432 the full 8,000-slot profile fits (12.93 GiB — the
+same cache the Release 1 32K production config ran). The +1.81 GiB of cache at 786K mostly
+offsets the −3.73 GiB of KV/QSA, which is why the 786K+vision peak (31,830) sits close to the
+1M text-only peak (32,494).
+
+Vision encoder measurements (`strata-vision`, SM70 CUDA build of the llama.cpp 3cf03257 mtmd
+path, `tools/vision/strata_vision.cpp`):
+- startup: `READY 2560` (n_embd matches the engine); loads the engine's own IQ3_XXS GGUF
+  shard vocab-only (no extra GPU memory for the text model).
+- encode: 512×512 test image → 256 image tokens (16×16 patch grid), 8,771 ms CPU-only vs
+  62–145 ms with `--gpu`; SVE1 embeddings file 2,621,460 B.
+- resident GPU footprint (measured on an idle V100): 3 → 1,209 MiB, i.e. **1,206 MiB**
+  (0.86 GiB mmproj weights + CUDA workspace).
+
+Decision: **1,048,576 is the measured text-only maximum; 786,432 is the maximum with the
+vision encoder resident** (the 3/4·1M step-down keeps a 938 MiB margin at the full fill; the
+next step, 524,288, was not needed).
+
+### 9.2 Regression at the new context (fresh engines, Release 1 flags + `--vision`)
+
+- 32-token golden prefix: **MATCH** — first token 271, first-32 == GOLDEN_32, run md5
+  cf577e731fbff35d91b879a23b670e56 = byte-identical to the Release 1 g32 runs at both 16K and 32K.
+- 256-token determinism ×3 fresh engines: **all three md5 = cdb7f7d056f339ba704d3bb9620a1dec**
+  = the Release 1 det anchor → the M-RoPE identity table (`--vision` on, no image in the prompt)
+  is numerics-invariant at 786,432.
+
+### 9.3 Production config (what changed)
+
+`strata-swift-iq3_xxs.json` (the service's config; gitignored, force-added with this commit):
+- `--max-context 32768` → `--max-context 786432`
+- `--vision` added to the engine args (M-RoPE position table: (786,432+64)×3×int32 ≈ 9.4 MB)
+- new top-level `"vision"` entry: `{exe: build-vision/bin/strata-vision, mmproj:
+  /mnt/ssd/llm_models/Qwen3.8-Flash-Next-GGUF/mmproj-Qwen3.8-Flash-Next-F16.gguf (904 MB,
+  F16), model: the engine's own GGUF shard (vocab-only), gpu: true}` — the serve layer spawns
+  the encoder as a resident subprocess; image embeddings are cached by image hash, so a
+  conversation re-sending the same picture encodes it once.
+
+No systemd unit changes (the unit already pins `CUDA_VISIBLE_DEVICES=0`,
+`LD_LIBRARY_PATH=/usr/local/cuda/lib64`, `STRATA_MOE_DQ_WIDE=1`; the encoder inherits all three).
+
+Service validation after `systemctl restart strata` (boot 2 m 05 s, incl. the vision encoder):
+- `/health`: `{"status": "ok", "max_context": 786432, "model": "swift-iq3_xxs", "images": true}`
+- live text request ok (62 prompt tokens, 32 completion).
+- live image request (`/v1/chat/completions`, data-URL 512×512 test image = red square top-left,
+  green triangle bottom-center, blue circle bottom-right): 325 prompt tokens (256 image tokens
+  through the GENI/SVE1 path) and the model described **all three shapes, colors and their
+  relative positions correctly** ("Top left: a red square … Bottom center: a green triangle,
+  pointing upward … Right side, partially behind the triangle: a blue circle").
+- encoder process resident (`strata-vision --mmproj … --gpu`, 1,206 MiB); `/health` stable
+  before/after; idle service VRAM 29,592 MiB (full-fill peak with encoder = 31,830 MiB, §9.1).

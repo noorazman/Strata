@@ -2,6 +2,34 @@
 
 Important historical changes and decisions. No raw logs.
 
+## 2026-10-02 — Post-release amendment: production context 32K → 786,432 + vision, on the frozen tag `v100-release1`
+
+User request: raise the production max-context toward ~1M tokens and enable vision on the same
+32 GB V100 (GPU0). Measured (Release 1 build, GPU0, int8 KV, full fills): **1,048,576 fits
+text-only** (session 15,297,861,120 B; the full 1,047,312-token prefill peaks at 32,494/32,768
+MiB — 274 MiB margin — then 128 decode @ 30.17 tok/s, clean exit, zero CUDA errors; prefill
+269.12 tok/s, TTFT 64.9 min) **but OOMs with the resident vision encoder**: the encoder
+(`strata-vision`, SM70 CUDA build of the llama.cpp 3cf03257 mtmd path, `tools/vision/strata_vision.cpp`)
+holds 1,206 MiB (0.86 GiB `mmproj-Qwen3.8-Flash-Next-F16.gguf` + workspace; 512×512 → 256 image
+tokens in 62–145 ms on-GPU vs 8.8 s CPU) and its 862.11 MiB cudaMalloc fails live while the 1M
+fill holds 32,298–32,494 MiB. Production therefore runs **786,432** max-context with `--vision`
+and the resident GPU0 encoder: the full 785,484-token prefill (384 chunks @ 305.74 tok/s, TTFT
+42.8 min) + 128 decode @ 33.70 tok/s **with the encoder resident and actively encoding
+(136 keep-alive encodes)** peaks at 31,830 MiB (938 MiB margin), rc=0, zero errors. The
+786K run keeps the full 8,000-slot expert-cache profile (12.93 GiB — the Release 1 32K
+production cache; at 1M the auto-sizing truncates it to 6,884 slots), which mostly offsets the
+KV/QSA savings. Regression at 786,432 with `--vision` on (fresh engines): 32-token golden prefix MATCH (first
+token 271; run md5 cf577e73… = byte-identical to the Release 1 16K/32K g32 runs) and 256-token
+determinism 3/3 fresh-engine md5 = cdb7f7d056f339ba704d3bb9620a1dec = the Release 1 det anchor.
+`strata-swift-iq3_xxs.json` gains `--max-context 786432`, `--vision`, and the `"vision"` entry
+(exe/mmproj/model/gpu:true); the systemd unit is unchanged (it already pins
+`CUDA_VISIBLE_DEVICES=0`, `LD_LIBRARY_PATH`, `STRATA_MOE_DQ_WIDE=1`). Service validation: boot
+2 m 05 s, `/health` max_context 786432 + images true, live text request ok, live image request
+correctly describes a 3-shape test image (256 image tokens via GENI/SVE1), idle VRAM 29,592 MiB.
+The frozen baseline remains tag `v100-release1` (7a901c7); this amendment is
+a new commit on top (config force-added, it is gitignored). Fill corpora: `bench/v100/fill-1047312.tok`
+(1,047,312 tokens) and `bench/v100/fill-785484.tok` (785,484 tokens, committed).
+
 ## 2026 — V100 Release 1 (production freeze, branch `stage1.3-expert-pool-sync`, tag `v100-release1`, GPU0 only)
 
 **RELEASE 1 READY — BASELINE FROZEN.** Productionization & validation milestone (NOT an optimization
