@@ -1471,8 +1471,6 @@ __global__ void __launch_bounds__(32) wide_flat_kernel(const void* __restrict__ 
     }
 }
 
-bool is_iq(int t) { return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11; }
-// the types dq_dispatch dequantizes
 bool is_iq(int t) {
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
            t == 12 || t == 13 || t == 7 || t == 8;
@@ -1675,6 +1673,8 @@ void iq_dequant_gu_f16_wide(int t, const void* gate, const void* up, int64_t n_f
         default: dequant_gu_kernel<<<dim3((unsigned) sb, 2), 32, 0, s>>>(t, gate, up, per_row, (__half*) dst); break;
     }
     check("iq_dequant_gu_f16_wide");
+}
+
 bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept {
     const int qg = gu_qk(gu_type), qd = d_qk(d_type);
     return qg > 0 && qd > 0 && is_iq(gu_type) && is_iq(d_type) && n_embd % qg == 0 && n_ff % qd == 0 &&

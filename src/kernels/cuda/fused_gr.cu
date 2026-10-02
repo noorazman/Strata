@@ -1057,7 +1057,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, flo
     else gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
     static bool attr = false;
     if (!attr) {
-        cudaFuncSetAttribute(gr_down_multi_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        cudaFuncSetAttribute(gr_down_multi_kernel<TILE>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int) (kFusedGrMaxT * TILE * sizeof(float)));
         cudaFuncSetAttribute(gr_down_multi_split_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int) (kFusedGrMaxT * TQ * 64 * sizeof(float)));
@@ -1068,7 +1068,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, flo
                                      (size_t) n_tok * TQ * 64 * sizeof(float), st>>>(m);
         gr_down_multi_reduce_kernel<<<DOWN_BLOCKS + 1, THREADS, 0, st>>>(m);
     } else {
-        gr_down_multi_kernel<<<DOWN_BLOCKS + 1, THREADS, (size_t) n_tok * TILE * sizeof(float), st>>>(m);
+        gr_down_multi_kernel<TILE><<<DOWN_BLOCKS + 1, THREADS, (size_t) n_tok * TILE * sizeof(float), st>>>(m);
     }
     gr_up_multi_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
     const cudaError_t e = cudaGetLastError();

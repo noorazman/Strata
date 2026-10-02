@@ -439,6 +439,7 @@ __global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t valu
         if (fence_period > 0 && (n % fence_period) == 0) __threadfence_system();
     }
     if (iters) *iters = n;   // Stage 1.6 probe: how many poll iterations the wait took
+}
 __global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
     while (*flag < value) strata_spin_pause();
     __threadfence_system();
@@ -460,6 +461,7 @@ static uint64_t wait_fence_period() {
 
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream, uint64_t* iters) {
     wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, iters, wait_fence_period());
+}
 namespace {
 __global__ void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int k, const int32_t* __restrict__ res,
                                      int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off,
