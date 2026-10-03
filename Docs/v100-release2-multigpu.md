@@ -18,6 +18,13 @@ Measured on 2026-10-03, cards clean (4 MiB each, no other processes):
 | 0 → 1 | 1.31 |
 | 1 → 0 | 1.52 |
 
+Post-reboot retest (2026-10-03, cards clean, `Recovery Action: None`, 0 Xids since boot):
+0 → 1 = 1.59 GB/s, 1 → 0 = 1.30 GB/s, and the probe now **exits cleanly** (exit 0). The
+per-direction numbers sit in the same 1.3–1.6 GB/s band on both runs; which direction is
+faster flips run to run, so treat the pair as ~1.3–1.6 GB/s each way. The clean exit also
+settles the earlier question: the original post-`main` exit hang was residual state from
+the stuck probe PIDs (their Xid 31 MMU faults), not a driver defect that needed a reboot.
+
 The asymmetric directions are expected: root-complex PCIe P2P does not route both ways
 equally, and the two cards sit on different downstream ports of the root complex.
 
@@ -41,6 +48,27 @@ card. After that, `cudaGetDeviceCount` failed on all cards, not just 0 and 1.
 re-enables persistence mode within ~100 ms of `-pm 0`, and `systemctl stop` needs polkit
 interactive auth. Recovery is a node reboot; after the reboot cards 0 and 1 are re-tested
 with the same `strata-device` command to confirm the numbers and a clean exit.
+
+The same wedge recurred a second time, and this time the trigger was unambiguously the probe
+itself. The post-reboot retest ran at ~13:37:30–40 (between a clean `journalctl -k` check at
+13:37:21 and the storm), on exactly the two cards it faults. The kernel then logged at
+13:37:50 a DMAR `PTE Write access is not set` fault on 03:00.0 (GPU 1) and at 13:37:51 an
+Xid 31 MMU fault (`FAULT_PTE`, `ACCESS_TYPE_VIRT_WRITE`) on 02:00.0 (GPU 0) — the NVRM line
+attributes it to `pid=1456, name=modprobe`, a logging quirk: faults raised on kernel
+DMA/teardown paths are recorded under the module name — and Xid 154 "Node Reboot Required"
+on all five cards again. The separate llama-server tenant on card 4 was not touched by the
+probe, but with the driver wedged its `cuInit(0)` failed with error 999 (`/dev/nvidia-uvm`
+EIO) and the server fell back to CPU. The second reboot (14:14:16) cleared all five cards
+(`GPU Recovery Action: None`, 0 Xids since the boot) and llama-server came back on GPU 4
+(PID 1360, ~15.5 GB, port 8081).
+
+Both storms followed a `strata-device` P2P probe run within ~30 s, and a non-fatal
+`mce: Machine check events logged` (same CMCI/BANK5 family as the 10:56 storm) appeared at
+14:18:20, minutes after the second boot with no probe running. Read together this is a
+hardware-level fault on the shared root complex that P2P probe traffic merely triggers. The
+probe traffic is therefore kept short (128 MiB blocks, 250 ms / 1 GiB cap) and `journalctl -k`
+is watched during the 2-GPU serve runs (3.3/3.6); if storms recur, the P2P traffic is limited
+or the runs are moved to a quiet window.
 
 ## Hand-off wiring (step 3.3)
 

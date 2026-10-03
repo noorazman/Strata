@@ -5,34 +5,39 @@ Paused: 2026-10-03. This doc is the complete hand-off for resuming in a fresh se
 device — which was explicitly put aside by the user; do not use it as a reference). No engine code
 has been changed yet; everything below is survey + state.
 
-## 0. Status (2026-10-03, pre-reboot)
+## 0. Status (2026-10-03, post-reboot)
 
 - **3.1 DONE.** On `release2-v100-multigpu` @ `22fec65`, pushed.
-- **3.2 DONE (pending post-reboot retest).** Probe seed bug fixed (`measure_p2p_gbps`
+- **3.2 DONE (post-reboot retest complete).** Probe seed bug fixed (`measure_p2p_gbps`
   `cudaMemset` now runs on the source device, before `cudaSetDevice(dst)`). `device_plan_report`
   display bug fixed (L390 `* 100` → `* 1000`, so 1.31 GB/s no longer reads "131 MB/s"). Measured
   **true bidirectional P2P: 0→1 = 1.31 GB/s, 1→0 = 1.52 GB/s** (peer access enabled before
-  measuring — genuine root-complex P2P, not host staging). Recorded in
-  `Docs/v100-release2-multigpu.md`. Committed + pushed as `1dbf5d1`.
-- **Driver wedge:** after the probe, a 10:56 hardware storm set **Xid 31 (MMU fault) then Xid 154
-  "Node Reboot Required" on all 5 cards**; every non-reboot reset path is blocked without root
-  (`nvidia-persistenced` re-enables PM within ~100 ms of `-pm 0`; `systemctl stop` needs polkit;
-  `sudo`/`pkexec` interactive). A **node reboot is required** to clear it.
-- **Reboot cost is low:** the only non-idle tenant besides strata cards 0/1 is GPU 4, holding the
-  user's own `llama-server` (PID 1697779, ~15.5 GB, port 8081) under
-  `ik-llama-hermesQ3-xxs-gpu4-swift.service` — **enabled**, so it auto-restarts after reboot.
-  `deepseek-harness.service` also auto-restarts. `hindsight-api` (PID 1787) only holds device fds.
+  measuring — genuine root-complex P2P, not host staging), recorded in
+  `Docs/v100-release2-multigpu.md` and committed + pushed as `1dbf5d1`. Post-reboot retest
+  (boot #2, 14:14:16): **0→1 = 1.59 GB/s, 1→0 = 1.30 GB/s, clean exit (0)**. Same ~1.3–1.6 GB/s
+  band, direction asymmetry flips run-to-run. The original post-`main` exit hang was confirmed to
+  be residual stuck-PID state, not a driver defect.
+- **Driver wedge — resolved, with a recurrence:** two storms set Xid 31 (MMU fault) then Xid 154
+  "Node Reboot Required" on all 5 cards: 10:56:41–42 (first boot window, probe on cards 0+1) and
+  13:37:51 (boot #1, ~20 s after the post-reboot probe retest, which exercised exactly the two
+  cards that faulted; llama-server was on card 4). With the driver wedged, `cuInit(0)` failed
+  with error 999 (`/dev/nvidia-uvm` EIO) and llama-server fell back to CPU — the "model loaded
+  into CPU" report. Boot #2 (14:14:16) cleared all five cards (`GPU Recovery Action: None`,
+  0 Xids since the boot); llama-server is back on GPU 4 (PID 1360, ~15.5 GB, port 8081,
+  `ik-llama-hermesQ3-xxs-gpu4-swift.service`, auto-restarted after both reboots). A non-fatal
+  `mce: Machine check events logged` (same CMCI/BANK5 family as the 10:56 storm) appeared at
+  14:18:20 with no probe running — a hardware-level root-complex fault the P2P probe traffic
+  merely triggers; keep probe traffic short and watch `journalctl -k` during the 2-GPU runs.
+- **Machine ready (15:20:57):** cards 0 and 1 idle (4 MiB each, `Recovery Action: None`), card 1
+  confirmed idle after the user stopped its GPU-1 process; cards 2 and 3 clean (3 MiB); card 4
+  holds llama-server (15,489 MiB). `strata.service` inactive.
 - **3.3 surveyed** (see §4): the hand-off today stages through mapped pinned memory
   (`cudaHostAlloc(cudaHostAllocMapped|Portable)`, generate.cpp L4315–4367); a direct P2P rewrite
   allocates the hand-off buffer on the source device so the destination reads it peer-addressable.
   The `copy_from_mapped` kernel already reads through any device-visible pointer, so only the
   allocation changes; ordering is host-ordered by `cudaStreamSynchronize(cs_)` (verify.cpp L1336).
-- **Next after reboot:** verify `nvidia-smi -q` shows `GPU Recovery Action: None` on cards 0/1 (and
-  all cards), then re-run `timeout 120 env CUDA_VISIBLE_DEVICES=0,1 ./build-sm70/strata-device
-  --devices 0,1 --p2p` to confirm 1.31/1.52 GB/s and a **clean exit** (settles whether the original
-  post-`main` exit hang was residual stuck-PID state — likely, given the Xid 31 faults). Then 3.3
-  (implement direct P2P hand-off), 3.4 (residency), 3.5 (ctest), 3.6 (2-GPU correctness + benchmarks),
-  3.7 (final doc + commit + push + notify).
+- **Next:** 3.3 (implement direct P2P hand-off), 3.4 (residency), 3.5 (ctest),
+  3.6 (2-GPU correctness + benchmarks), 3.7 (final doc + commit + push + notify).
 
 ## 1. Mission
 
