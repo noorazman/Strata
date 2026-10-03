@@ -323,7 +323,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     cap_ = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     max_blocks_ = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
     attn_scratch_floats_ = (int64_t) strata::kernels::qsa_decode_attn_scratch_floats(cap_, s);
-    const uint64_t qsa_max_cells = (uint64_t) ss.qsa_states[0].max_cells;   // Stage 1.7 E4: slow-selection score row
+    const uint64_t qsa_max_cells = (uint64_t) ss.qsa_states[ss.qsa_primary()].max_cells;   // Stage 1.7 E4: slow-selection score row
 
     const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, K = (uint64_t) ss.k;
     const uint64_t C = (uint64_t) g.ssm_conv_channels, ZV = (uint64_t) g.ssm_value_dim, HV = (uint64_t) g.ssm_v_heads;
@@ -1163,7 +1163,6 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
-    if (pos0 + T > ss.qsa_states[0].max_cells) { err = "verify: the window runs past the context"; return false; }
     // Stage 1.6 probe: one poll-iteration slot per (layer, group) wait (flag A/B/C).  Allocated here, OUTSIDE
     // stream capture (record_window runs inside it, and a cudaHostAlloc there poisons the capture).
     if (std::getenv("STRATA_WAIT_ITERS") != nullptr && d_wait_iters_ == nullptr) {
