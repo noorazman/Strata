@@ -300,11 +300,12 @@ double measure_p2p_gbps(int src, int dst) {
     const uint64_t bytes = 128ull << 20;
     check(cudaSetDevice(src), "cudaSetDevice(src)");
     check(cudaMalloc(&g.s, (size_t) bytes), "p2p probe: cudaMalloc on the source");
+    // Seed the source with a pattern, not zeros: a pattern makes a transfer that silently moves nothing
+    // visible if this probe is ever run by hand.  cudaMemset takes the pointer in the CURRENT device's
+    // address space, so it must run on the source device, not the destination's.
+    check(cudaMemset(g.s, 0x5a, (size_t) bytes), "p2p probe: seed");
     check(cudaSetDevice(dst), "cudaSetDevice(dst)");
     check(cudaMalloc(&g.d, (size_t) bytes), "p2p probe: cudaMalloc on the destination");
-    // Seed the source with a pattern, not zeros: a pattern makes a transfer that silently moves nothing
-    // visible if this probe is ever run by hand.
-    check(cudaMemset(g.s, 0x5a, (size_t) bytes), "p2p probe: seed");
     check(cudaSetDevice(src), "cudaSetDevice(src) again");
     check(cudaEventCreate(&g.a), "p2p probe: event a");
     check(cudaEventCreate(&g.b), "p2p probe: event b");
@@ -386,7 +387,7 @@ std::string device_plan_report(const DevicePlan& plan) {
             if (i == j || !plan.p2p[i][j]) continue;
             if (any) s += ", ";
             s += std::to_string(plan.ordinals[i]) + "->" + std::to_string(plan.ordinals[j]) +
-                 (plan.p2p_gbps[i][j] > 0 ? " (" + std::to_string((long long) (plan.p2p_gbps[i][j] * 100 + 0.5)) +
+                 (plan.p2p_gbps[i][j] > 0 ? " (" + std::to_string((long long) (plan.p2p_gbps[i][j] * 1000 + 0.5)) +
                                                 " MB/s)"
                                           : std::string());
             any = true;
