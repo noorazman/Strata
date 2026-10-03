@@ -1,11 +1,11 @@
 # Release 2 — Multi-GPU MoE on 2× V100 32GB: resume document
 
-Paused: 2026-10-03. This doc is the complete hand-off for resuming in a fresh session. It replaces
-`Docs/v100-release2-phase2-resume.md` (the older phase-2 mission — move QSA state to an auxiliary
-device — which was explicitly put aside by the user; do not use it as a reference). No engine code
-has been changed yet; everything below is survey + state.
+Paused: 2026-10-04, after the first end-to-end run of the **direct-P2P** hand-off path. This doc is
+the complete hand-off for resuming in a fresh session. It replaces `Docs/v100-release2-phase2-resume.md`
+(the older phase-2 mission — move QSA state to an auxiliary device — which was explicitly put aside
+by the user; do not use it as a reference).
 
-## 0. Status (2026-10-03, post-reboot)
+## 0. Status (2026-10-04, direct-P2P run complete)
 
 - **3.1 DONE.** On `release2-v100-multigpu` @ `22fec65`, pushed.
 - **3.2 DONE (post-reboot retest complete).** Probe seed bug fixed (`measure_p2p_gbps`
@@ -31,13 +31,61 @@ has been changed yet; everything below is survey + state.
 - **Machine ready (15:20:57):** cards 0 and 1 idle (4 MiB each, `Recovery Action: None`), card 1
   confirmed idle after the user stopped its GPU-1 process; cards 2 and 3 clean (3 MiB); card 4
   holds llama-server (15,489 MiB). `strata.service` inactive.
-- **3.3 surveyed** (see §4): the hand-off today stages through mapped pinned memory
-  (`cudaHostAlloc(cudaHostAllocMapped|Portable)`, generate.cpp L4315–4367); a direct P2P rewrite
-  allocates the hand-off buffer on the source device so the destination reads it peer-addressable.
-  The `copy_from_mapped` kernel already reads through any device-visible pointer, so only the
-  allocation changes; ordering is host-ordered by `cudaStreamSynchronize(cs_)` (verify.cpp L1336).
-- **Next:** 3.3 (implement direct P2P hand-off), 3.4 (residency), 3.5 (ctest),
-  3.6 (2-GPU correctness + benchmarks), 3.7 (final doc + commit + push + notify).
+- **3.3 implemented (`7b10cff`) and the direct path is now exercised end-to-end — and it is BROKEN.**
+  The direct-P2P hand-off (generate.cpp L4327–4351: logs `direct P2P (cudaMemcpyPeerAsync)` when
+  `p2p[si][di] == 1`, else `pinned-host staging (fallback)`) was run with `--devices 0,1`: plan
+  line reads `p2p 0->1, 1->0`, hand-off line reads `strata serve: layer split hand-off: direct P2P
+  (cudaMemcpyPeerAsync)`. The run completed (exit 0) but the output is wrong:
+    - **All 256 tokens are `0`** (`T 0` × 256; DONE line `DONE 256 29 1018.3 18774.6 length 0 0 0
+      122880 122880 0 0 0.0`). The fallback run (same config, no `--devices`) produced real tokens
+      (first token 271, golden-32 prefix, diverging from the single-GPU anchor only at index 42).
+      So the direct path diverges from token **0**, not 42.
+    - **13.6 tok/s** (256 generated in 18,775 ms) — ~5× slower than the fallback run's 67.7 tok/s
+      (3,469 ms). The prompt path is fine (29 tokens in 1,018 ms, 28.5 tok/s).
+    - **Drafts offered 0** (the fallback run offered 225, accepted 137). Stop reason `length` (hit
+      the 256 cap), not `stop`.
+    - Expert cache hit 100.0% (122,880 / 122,880 lookups) — residency is intact. VRAM peaks
+      card 0 = 20,380 MiB, card 1 = 32,014 MiB (same asymmetric auto layout as the fallback).
+    - **Xid 154 storm at 06:19:32** on PCI `0000:82:00` / `0000:83:00` / `0000:84:00` = cards 2, 3, 4
+      (the SXM2 cards + the llama-server card) — **not** cards 0, 1 (the P2P cards). This differs
+      from the 10:56 and 13:37:51 storms, which hit all five cards. llama-server (card 4) is still
+      active (92% util, 15,513 MiB).
+    - **Root-cause hypothesis (unconfirmed — the new session's job):** the direct hand-off buffer is
+      allocated on the LATER stage's device (CUDA1) and zeroed (`cudaMemset(h, 0, hb)`,
+      generate.cpp L4339); if the earlier stage's peer write (`copy_from_mapped` writing
+      `hand_out_`) does not land in that buffer, the second stage (CUDA1, layers 20–47) reads an
+      all-zero residual and the head outputs token 0. The 5× slowdown and drafts-offered-0 may be
+      the same root cause or a separate symptom. The fallback (pinned-host) path is correct through
+      token 41, so the copy kernel and staging are fine — only the device-buffer allocation differs.
+- **3.4 PASS.** 100% expert residency: 24,552 of 24,576 profiled pairs resident (logged "100% of
+  the experts resident"); CUDA0 10,240 slots / 14.33 GiB + CUDA1 14,312 slots / 25.59 GiB
+  (asymmetric auto layout, not the 12,288/card symmetric plan); PLE 26.82 GiB RAM-resident; int8 KV.
+- **3.5 DONE.** Clean SM70 build; `ctest --test-dir build-sm70` = 30/31 (only `ple_parity` fails,
+  environmental: missing `../../Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf`).
+- **3.6 IN PROGRESS — two distinct behaviors to reconcile:**
+  - **Fallback run (bash-192, `--layer-split auto`, no `--devices`):** PASSES exit 0, golden-32
+    prefix, first token 271, 235 tokens, VRAM gate PASS (card 0 20,396 / card 1 32,038 MiB). BUT
+    **diverges from the single-GPU R1 anchor at token index 42** (anchor `781`, 2-GPU `279`);
+    tokens 0–41 are bit-identical to the anchor. All three anchors (serve `s110-ctx32768-det1/det2`
+    + engine `r2x-det1`) agree at md5 `cdb7f7d056f339ba704d3bb9620a1dec`, so the anchor is
+    mode-independent; the 2-GPU fallback run is the divergent one. **Two prime suspects (not yet
+    isolated):** (a) expert residency mismatch (2-GPU 24,552 resident / 100.0% hit vs anchor
+    ~8,000 slots / 83.38% hit); (b) `STRATA_MOE_DQ_WIDE=1` set in the 2-GPU runs but not the anchor
+    (code claims "bit-identical", unverified; no log line distinguishes — grep 0 in all three logs).
+    **Control lever confirmed:** the `--expert-cache N` flag (generate.cpp L556: "R4: keep N expert
+    blobs resident in VRAM and compute their rows on the [CPU]") enables a matched-residency
+    control run.
+  - **Direct run (this span, `--devices 0,1`):** exercises the direct path; broken (all-zero
+    tokens) — see 3.3 above.
+  - **Carve-regression fix committed `e114f3d`:** the `ERR verify: the window runs past the context`
+    failure was a stale pre-carve `qsa_states[0]` gate (old L1166, re-introduced by merge
+    `179aeb3`) + L326 `qsa_max_cells` `[0]`. Fixed: deleted L1166; L326 →
+    `ss.qsa_states[ss.qsa_primary()].max_cells`. Rebuilt clean; the fallback rerun passes.
+- **3.7 PENDING.**
+- **Machine state at pause (06:35):** cards 0 and 1 idle (4 / 86 MiB), cards 2 and 3 clean
+  (3 MiB), card 4 holds llama-server (15,513 MiB, 92% util, still active after the 06:19:32 Xid
+  storm). No leftover `strata` processes. Cards 0, 1 = PCI `0000:02:00.0` / `0000:03:00.0`;
+  cards 2, 3, 4 = `0000:82:00.0` / `0000:83:00.0` / `0000:84:00.0`.
 
 ## 1. Mission
 
@@ -212,26 +260,43 @@ Facts established by the survey that make this a small change:
 
 ## 7. Pending checklist (resume here)
 
-1. **3.1** `cd ~/dsh/strata/Strata`; `git checkout main` (create local tracking
-   `origin/main` if needed); `git merge release3-qwen35-dense -m "Merge 0.1.35 sync from
-   release3-qwen35-dense into main"`; `git push origin main`;
-   `git checkout -b release2-v100-multigpu`; `git push -u origin release2-v100-multigpu`.
-   (Untracked Logs/bench artifacts don't block; handle the modified `Logs/benchmarks/*`
-   files as needed for a clean merge.)
-2. **3.2** apply the device.cu fix (§5), rebuild, run the probe, record GB/s.
-3. **3.3** implement the direct P2P hand-off (§6) + fallback + startup log.
-4. **3.4** verify residency: 12,288 experts/card in cache logs
-   (generate.cpp L3024 prints per-stage cache slots/GiB), `--ple-io ram` default,
-   int8 KV filling the remaining ~10–12 GiB/card.
-5. **3.5** clean SM70 build + ctest (expect 30/31).
-6. **3.6** 2-GPU correctness run (`CUDA_VISIBLE_DEVICES=0,1 --layer-split auto`,
-   `--serve`), verify first token 271 + golden 32-prefix + balanced VRAM + 0 CUDA errors;
-   then `s110.sh ctx 16384` / `ctx 32768` benchmarks vs Strata-Pure
-   (`/home/noorazman/Strata-Pure`), capture TTFT, prefill/decode tok/s, spec acceptance,
-   VRAM peaks, P2P GB/s.
-7. **3.7** `Docs/v100-release2-multigpu.md`, commit, push,
-   `~/.dsh/bin/dsh-notify "Release 2: 2x V100 32GB multi-GPU P2P setup and benchmarks
-   complete"`, final structured summary vs Strata-Pure and Release 1.
+1. **3.1 DONE.** `release2-v100-multigpu` @ `22fec65`, pushed.
+2. **3.2 DONE** (`1dbf5d1`). Measured P2P 0→1 = 1.31 / 1.59 GB/s, 1→0 = 1.52 / 1.30 GB/s (two
+   clean runs), recorded in `Docs/v100-release2-multigpu.md`.
+3. **3.3 DONE but BROKEN — root-cause next.** Direct P2P hand-off implemented (`7b10cff`), built,
+   exercised end-to-end for the first time with `--devices 0,1`. The direct path is taken (plan
+   `p2p 0->1, 1->0`, log `direct P2P (cudaMemcpyPeerAsync)`) but the run is numerically
+   degenerate: all 256 tokens `0`, 13.6 tok/s (5× slower than the fallback's 67.7), drafts
+   offered 0 (vs 225), stop reason `length`, 100.0% cache hit, VRAM peaks 20,380 / 32,014 MiB.
+   **Investigate:** the peer-write path in `Verifier::run` (hand-off buffer = device memory on
+   CUDA1, `cudaMemset` zeroed, written by card 0's stage-0 kernel via peer), `plan_sink` /
+   `split_drive` wiring, why the spec head offered 0 drafts, and why the prompt path is 3× slower.
+   The fallback path is correct through token 41, so the copy kernel + staging are fine — only the
+   device-buffer allocation differs.
+4. **3.4 DONE (PASS).** 100% expert residency (24,552 / 24,576), PLE 26.82 GiB RAM-resident, int8
+   KV.
+5. **3.5 DONE.** Clean SM70 build + `ctest --test-dir build-sm70` = 30/31 (only `ple_parity`
+   fails, environmental).
+6. **3.6 IN PROGRESS — next actions, in order:**
+   - **Isolate the fallback token-42 divergence** (vs single-GPU anchor). Two prime suspects, not
+     yet isolated: (a) expert residency mismatch (2-GPU 24,552 resident / 100.0% hit vs anchor
+     ~8,000 slots / 83.38% hit) — run a matched-residency control with `--expert-cache N` (the
+     anchor's exact slot count) or toggle residency; (b) `STRATA_MOE_DQ_WIDE=1` (2-GPU runs) vs off
+     (anchor) — toggle it explicitly in a control run. All 24,576 experts (~44.5 GiB) don't fit one
+     32 GB card, so "single-GPU all-resident" is not directly runnable — use `--expert-cache N` to
+     match the anchor's resident set.
+   - **16K/32K serve-mode benchmarks** (config fork with `"gpu": [0, 1]` + `--max-context`
+     16384/32768, `serve.server --engine strata` pattern from `s110.sh`) capturing TTFT, prefill
+     tok/s, decode tok/s (L5796 stderr line), spec acceptance, VRAM peaks both cards, P2P GB/s —
+     vs Strata-Pure r3gp references.
+   - **Monitor `journalctl -k` during the 2-GPU runs** for Xid storms (the 06:19:32 storm hit
+     cards 2/3/4, not the P2P cards 0/1 — a new data point; confirm whether repeated P2P traffic
+     reliably triggers it).
+7. **3.7 PENDING.** Fill `Docs/v100-release2-multigpu.md` L57–65 placeholders (verify root cause +
+   fix, fallback-vs-direct finding incl. the all-zero bug, token-42 divergence + both suspects,
+   P2P numbers, benchmarks), commit, push,
+   `~/.dsh/bin/dsh-notify "Release 2: 2x V100 32GB multi-GPU P2P setup and benchmarks complete"`,
+   final structured summary vs Strata-Pure and Release 1.
 
 ## 8. Conventions + constraints
 
