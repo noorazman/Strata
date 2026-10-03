@@ -4316,14 +4316,38 @@ int main(int argc, char** argv) {
             const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             std::vector<float*> hand((size_t) n_stages - 1, nullptr);
-            for (float*& h : hand) {
-                float* hh = nullptr;
-                if (cudaHostAlloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-                    cudaHostGetDevicePointer((void**) &h, hh, 0) != cudaSuccess) {
-                    std::fprintf(stderr, "strata serve: the layer-split hand-off allocation failed\n");
-                    return 1;
+            // Release 2 step 3.3: direct P2P hand-off. Each boundary's buffer is either pinned mapped host
+            // memory (the fallback: portable, any stage reads it) or a device buffer on the LATER stage's
+            // device, which the earlier stage's copy kernel writes peer-to-peer. The plan (devices) already
+            // enabled peer access on every usable pair before this point, and Verifier::run orders each
+            // stage's write before the next stage's read with the host-ordered cudaStreamSynchronize(cs_)
+            // (verify.cpp), so no CUDA event is needed. p2p[a][b] == 1 means device a may address device b's
+            // memory; the diagonal is 1, so a same-device boundary needs no peer.
+            for (int st = 0; st + 1 < n_stages; ++st) {
+                const int dev_src = st == 0 ? devices.primary() : stages[(size_t) st - 1]->dev;
+                const int dev_dst = stages[(size_t) st]->dev;
+                const int si = devices.index_of(dev_src);
+                const int di = devices.index_of(dev_dst);
+                const bool direct = si >= 0 && di >= 0 && devices.p2p[(size_t) si][(size_t) di] == 1;
+                float* h = nullptr;
+                if (direct) {
+                    const strata::core::OnDevice on(dev_dst);
+                    if (cudaMalloc((void**) &h, hb) != cudaSuccess || cudaMemset(h, 0, hb) != cudaSuccess) {
+                        std::fprintf(stderr, "strata serve: the layer-split hand-off allocation failed\n");
+                        return 1;
+                    }
+                    std::fprintf(stderr, "strata serve: layer split hand-off: direct P2P (cudaMemcpyPeerAsync)\n");
+                } else {
+                    float* hh = nullptr;
+                    if (cudaHostAlloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                        cudaHostGetDevicePointer((void**) &h, hh, 0) != cudaSuccess) {
+                        std::fprintf(stderr, "strata serve: the layer-split hand-off allocation failed\n");
+                        return 1;
+                    }
+                    std::memset(hh, 0, hb);
+                    std::fprintf(stderr, "strata serve: layer split hand-off: pinned-host staging (fallback)\n");
                 }
-                std::memset(hh, 0, hb);
+                hand[(size_t) st] = h;
             }
             split_drive.base = &drive;
             split_drive.n = n_stages;
