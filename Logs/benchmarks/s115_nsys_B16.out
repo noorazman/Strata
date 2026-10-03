@@ -1,0 +1,4 @@
+wrote Logs/gpu/s115nsys-16k-gen.txt (16384 prompt tokens)
+[07:57:58] CAP s115nsys-16k-on (baseline: auto + 8K profile)
+s115nsys-16k-on rc=0
+export rc=0

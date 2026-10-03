@@ -1,39 +1,51 @@
-strata generate: this CPU has no AVX-512: the expert kernels run on AVX2
-strata generate: native pack: packs/swift-iq3_xxs experts (largest blob 2.33 MB), token embedding type 21 in mapped host memory (260 MiB)
+strata generate: this CPU has no AVX-512: the expert kernels run on AVX-2 (multi-token for the i-quant gate/up rows)
+strata generate: native pack: packs/swift-iq3_xxs experts (largest blob 2.33 MB), token embedding IQ3_S in mapped host memory (260 MiB)
+strata devices: primary 0 (Tesla V100-PCIE-32GB, sm_70, 31.37 GiB free / 31.73 GiB total); p2p none
 strata generate: 1466 MiB of weights loaded from packs/swift-iq3_xxs (302 canonical tensors skipped: served natively)
 strata generate: 300 native projection matrices, 1781.11 MiB of weights
-strata ttft config: {"max_context": 16384, "kv": "int8", "qsa_layers": 12, "gdn_layers": 36, "kv_bytes_per_token": 1056, "kv_cache_capacity_bytes": 207618048, "session_bytes": 364010496, "qsa_state_bytes_first": 23596624, "qsa_state_bytes_rest": 19402320, "qsa_buffers_bytes": 5251664}
-strata generate: PLE ram: preloaded 320001536 rows (26.82 GiB) in 20.00 s (1.34 GiB/s); RAM-resident for the whole run
+strata ttft config: {"max_context": 16384, "kv": "int8", "qsa_layers": 12, "gdn_layers": 36, "kv_bytes_per_token": 1056, "kv_cache_capacity_bytes": 207618048, "session_bytes": 364206336, "qsa_state_bytes_first": 23612944, "qsa_state_bytes_rest": 19418640, "qsa_buffers_bytes": 5251664}
+strata generate: PLE ram: preloaded 320001536 rows (26.82 GiB) in 22.58 s (1.19 GiB/s); RAM-resident for the whole run
 strata generate: PLE on, table 320001536 rows of /mnt/ssd/llm_models/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf (PLE I/O mode: ram)
+strata generate: profile data/expert-profile.bin: 24576 ranked pairs, built for 24576 slots
+strata generate: PLE on, table 320001536 rows of /mnt/ssd/llm_models/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf
+strata mtp: draft layer loaded, 814 MiB of VRAM (experts 675, dense 111), files read in 7.26 s (108 MiB/s)
+strata generate: GPU 0: Tesla V100-PCIE-32GB, compute capability 7.0
 strata experts: arena first-touch pinned to node 0 (default: the host thread's node (Stage 1.6))
 strata generate: expert arena: cudaHostRegister PORTABLE ok; MAP_HUGETLB unavailable (no hugetlb pool configured?); using 4 KB pages
-strata generate: loaded 39.97 GiB at 1.08 GiB/s
-strata mtp: draft layer loaded, 813 MiB of VRAM (experts 675, dense 111)
-strata generate: profile data/expert-profile.bin: 8000 ranked pairs, built for 8000 slots
-strata generate: expert cache auto: 26.85 GiB free, 700 MiB reserved -> 8000 slots
-strata generate: expert cache 8000 slots, 12.93 GiB of VRAM; policy is
-strata generate: *** WARNING: --expert-cache is enabled and the GPU hit path is NOT
-                 CORRECT. The generated tokens diverge from a cache-off run (measured:
-                 first difference at token 40 at 2.97% hits, token 0 at 54.4%). Any
-                 timing from this run is real; any OUTPUT from it is not. ***
+strata generate: loaded 39.97 GiB at 1.32 GiB/s
+strata generate: experimental native Q5_K head, 437043200 bytes
+strata generate: expert cache auto: 26.39 GiB free, 700 MiB reserved (+73 MiB for the draft head) -> 11814 slots
+strata generate: expert cache 15764 slots, 25.63 GiB of VRAM; policy is
+strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,
+                 so a reply can differ slightly from a run without the cache (same quality:
+                 bench/results/2026-09-27-cache-parity).
                  PROFILE, ranked by routing frequency, no eviction.
-strata generate: pre-filled 8000 of 8000 slots from the profile; slot 0 verified
+strata generate: pre-filled 15764 of 15764 slots from the profile; slot 0 verified
 strata generate: R4 hit path ON - resident experts are computed on the GPU
 strata generate: 24 expert-pool workers + the host thread (worker park: hybrid spin-2048us+futex (default), rows: async (workers raise flag C))
-strata generate: session is up; locating the head
-strata generate: experimental native Q5_K head, 437043200 bytes
-strata generate: token graph hit path: 8000 resident experts, decided on the device
-strata verify: window up to 4 tokens, 61.9 MiB of device buffers
+strata generate: session is up (engine 0.1.35)
+strata generate: token graph hit path: 15764 resident experts, decided on the device
+strata serve: the prompt path borrows 1087 CUDA0 cache slots (1.82 GiB)
+strata hc: CUDA0: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+strata verify: window up to 6 tokens, 73.0 MiB of device buffers
 strata mtp: draft head over 40525 tokens (68.0 MiB)
-strata verify: captured the 1-token window (upload no error, sync no error)
+strata serve: 496 MiB of VRAM free with everything loaded
 strata verify: captured the 4-token window (upload no error, sync no error)
-strata serve ttft: {"prompt_tokens": 152, "max_new": 8, "t_parse_us": 44, "t_prefill_start_us": 891, "t_prefill_end_us": 2606368, "t_ready_us": 2769607, "t_first_window_us": 2769609, "t_first_token_us": 2868991, "t_first_token_out_us": 2869008, "generated": 8, "t_done_us": 3020497, "prefill_chunks": 1, "prefill_ms": 2605.5, "prefill_ple_ms": 26.8, "experts_streamed": 6959, "experts_dma": 6959, "experts_resident": 4466, "experts_host_ms": 41.9}
-strata serve: 152 prompt tokens in 2770 ms (54.9 tok/s), 8 generated in 251 ms (31.9 tok/s)
-strata verify: captured the 2-token window (upload no error, sync no error)
-strata serve ttft: {"prompt_tokens": 1076, "max_new": 16, "t_parse_us": 76, "t_prefill_start_us": 767, "t_prefill_end_us": 3175861, "t_ready_us": 3337569, "t_first_window_us": 3337571, "t_first_token_us": 3365357, "t_first_token_out_us": 3365370, "generated": 16, "t_done_us": 3719363, "prefill_chunks": 2, "prefill_ms": 5780.6, "prefill_ple_ms": 162.2, "experts_streamed": 19101, "experts_dma": 19101, "experts_resident": 9858, "experts_host_ms": 108.5}
-strata serve: 1076 prompt tokens in 3337 ms (322.4 tok/s), 16 generated in 382 ms (41.9 tok/s)
+strata verify: captured the 1-token window (upload no error, sync no error)
 strata verify: captured the 3-token window (upload no error, sync no error)
-strata serve ttft: {"prompt_tokens": 16120, "max_new": 256, "t_parse_us": 833, "t_prefill_start_us": 1579, "t_prefill_end_us": 32479111, "t_ready_us": 32640745, "t_first_window_us": 32640748, "t_first_token_us": 32667318, "t_first_token_out_us": 32667334, "generated": 256, "t_done_us": 37856621, "prefill_chunks": 10, "prefill_ms": 38258.1, "prefill_ple_ms": 2127.6, "experts_streamed": 117590, "experts_dma": 117590, "experts_resident": 46933, "experts_host_ms": 668.9}
-strata serve: 16120 prompt tokens in 32640 ms (493.9 tok/s), 256 generated in 5216 ms (49.1 tok/s)
-strata serve ttft: {"prompt_tokens": 16120, "max_new": 256, "t_parse_us": 926, "t_prefill_start_us": 1672, "t_prefill_end_us": 32171970, "t_ready_us": 32332927, "t_first_window_us": 32332928, "t_first_token_us": 32358403, "t_first_token_out_us": 32358415, "generated": 256, "t_done_us": 36949949, "prefill_chunks": 18, "prefill_ms": 70428.4, "prefill_ple_ms": 4090.6, "experts_streamed": 212010, "experts_dma": 212010, "experts_resident": 88077, "experts_host_ms": 1206.1}
-strata serve: 16120 prompt tokens in 32332 ms (498.6 tok/s), 256 generated in 4617 ms (55.4 tok/s)
+strata serve ttft: {"prompt_tokens": 152, "max_new": 8, "t_parse_us": 57, "t_prefill_start_us": 765, "t_prefill_end_us": 1615383, "t_ready_us": 1615383, "t_first_window_us": 1615868, "t_first_token_us": 1663733, "t_first_token_out_us": 1663747, "generated": 8, "t_done_us": 1800018, "prefill_chunks": 1, "prefill_ms": 1399.0, "prefill_ple_ms": 2.2, "experts_streamed": 2583, "experts_dma": 2583, "experts_resident": 8736, "experts_host_ms": 12.0}
+strata serve: prompt 152 tokens = 0 reused + 152 read in 1615 ms (94.1 tok/s), 8 generated in 184 ms (43.4 tok/s), drafts accepted 4 of 5, 1 checkpoints
+strata serve: decode expert cache hit rate: 95.2% (4114 hits / 4320 lookups)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata serve ttft: {"prompt_tokens": 1076, "max_new": 16, "t_parse_us": 201, "t_prefill_start_us": 9294, "t_prefill_end_us": 2182647, "t_ready_us": 2182647, "t_first_window_us": 2183159, "t_first_token_us": 2205674, "t_first_token_out_us": 2205686, "generated": 16, "t_done_us": 2475392, "prefill_chunks": 2, "prefill_ms": 3277.7, "prefill_ple_ms": 7.3, "experts_streamed": 12321, "experts_dma": 12321, "experts_resident": 19830, "experts_host_ms": 44.8}
+strata serve: prompt 1076 tokens = 0 reused + 1076 read in 2182 ms (493.0 tok/s), 16 generated in 291 ms (54.9 tok/s), drafts accepted 10 of 11, 1 checkpoints
+strata serve: decode expert cache hit rate: 97.7% (9382 hits / 9600 lookups)
+strata serve ttft: {"prompt_tokens": 16120, "max_new": 256, "t_parse_us": 1274, "t_prefill_start_us": 10676, "t_prefill_end_us": 21835797, "t_ready_us": 21835797, "t_first_window_us": 21836571, "t_first_token_us": 21859542, "t_first_token_out_us": 21859554, "generated": 256, "t_done_us": 25681812, "prefill_chunks": 10, "prefill_ms": 24777.4, "prefill_ple_ms": 21.8, "experts_streamed": 91513, "experts_dma": 91513, "experts_resident": 98769, "experts_host_ms": 318.1}
+strata serve: prompt 16120 tokens = 0 reused + 16120 read in 21834 ms (738.3 tok/s), 256 generated in 3845 ms (66.6 tok/s), drafts accepted 143 of 181, 1 checkpoints
+strata serve: decode expert cache hit rate: 95.2% (134060 hits / 140840 lookups)
+strata serve: suffix drafts: 22 windows, 61 of 66 drafts accepted
+strata serve ttft: {"prompt_tokens": 16120, "max_new": 256, "t_parse_us": 2373, "t_prefill_start_us": 21501, "t_prefill_end_us": 59385, "t_ready_us": 59385, "t_first_window_us": 60125, "t_first_token_us": 82942, "t_first_token_out_us": 82950, "generated": 256, "t_done_us": 4303796, "prefill_chunks": 10, "prefill_ms": 24777.4, "prefill_ple_ms": 21.8, "experts_streamed": 91513, "experts_dma": 91513, "experts_resident": 98769, "experts_host_ms": 318.1}
+strata serve: prompt 16120 tokens = 16115 reused + 5 read in 57 ms (87.9 tok/s), 256 generated in 4243 ms (60.3 tok/s), drafts accepted 122 of 177, 1 checkpoints
+strata serve: decode expert cache hit rate: 98.2% (146504 hits / 149258 lookups)
+strata serve: suffix drafts: 10 windows, 30 of 30 drafts accepted
+strata pool async rows: 4393 phases, 797.7 ms total wall, 0.18 ms/phase
